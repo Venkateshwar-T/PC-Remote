@@ -36,7 +36,18 @@ var (
 	procSetWindowPos      = modUser32.NewProc("SetWindowPos")
 	procSwitchToThisWindow = modUser32.NewProc("SwitchToThisWindow")
 	procAllowSetForegroundWindow = modUser32.NewProc("AllowSetForegroundWindow")
+	procGetCurrentProcess        = modKernel32.NewProc("GetCurrentProcess")
+	procSetProcessWorkingSetSize = modKernel32.NewProc("SetProcessWorkingSetSize")
 )
+
+func trimWorkingSet() {
+	debug.FreeOSMemory()
+	hProc, _, _ := procGetCurrentProcess.Call()
+	if hProc != 0 {
+		minusOne := ^uintptr(0)
+		procSetProcessWorkingSetSize.Call(hProc, minusOne, minusOne)
+	}
+}
 
 func main() {
 	// Memory optimization: instruct Go runtime to actively return idle heap pages to Windows
@@ -177,15 +188,16 @@ func main() {
 		os.Exit(0)
 	})
 
-	// Immediate startup memory purge to reclaim temporary initialization buffers
-	debug.FreeOSMemory()
-
-	// Periodic memory scavenger: keeps idle memory footprint at lowest possible level (~15-20 MB)
+	// Periodic memory scavenger: flushes unused working set pages back to Windows OS
 	go func() {
-		ticker := time.NewTicker(60 * time.Second)
+		// Initial trim after initialization settles
+		time.Sleep(3 * time.Second)
+		trimWorkingSet()
+
+		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			debug.FreeOSMemory()
+			trimWorkingSet()
 		}
 	}()
 

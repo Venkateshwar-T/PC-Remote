@@ -15,8 +15,6 @@ import (
 
 var DefaultRelays = []string{
 	"wss://relay.damus.io",
-	"wss://nos.lol",
-	"wss://relay.primal.net",
 }
 
 type Packet struct {
