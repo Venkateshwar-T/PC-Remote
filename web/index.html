@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="theme-color" content="#09090b">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>PC Remote</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" type="image/png" href="icon.png">
+  <link rel="apple-touch-icon" href="icon.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- PIN Screen -->
+    <div id="pinView" class="pin-view">
+      <div class="connection-bridge-wrap">
+        <div class="bridge-node">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="3" width="20" height="14" rx="2"/>
+            <line x1="8" y1="21" x2="16" y2="21"/>
+            <line x1="12" y1="17" x2="12" y2="21"/>
+          </svg>
+        </div>
+        <div class="bridge-line">
+          <div class="bridge-dot"></div>
+          <div class="bridge-dot"></div>
+          <div class="bridge-dot"></div>
+          <div class="bridge-dot active"></div>
+          <div class="bridge-dot"></div>
+          <div class="bridge-dot"></div>
+          <div class="bridge-dot"></div>
+        </div>
+        <div class="bridge-node">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="5" y="2" width="14" height="20" rx="3"/>
+            <line x1="12" y1="18" x2="12.01" y2="18"/>
+          </svg>
+        </div>
+      </div>
+
+      <div class="pin-title">Enter your 6-digit PIN</div>
+      <div class="pin-subtitle">Authenticate to control this laptop</div>
+      <div class="pin-dots">
+        <div class="pin-dot" id="dot0"></div>
+        <div class="pin-dot" id="dot1"></div>
+        <div class="pin-dot" id="dot2"></div>
+        <div class="pin-dot" id="dot3"></div>
+        <div class="pin-dot" id="dot4"></div>
+        <div class="pin-dot" id="dot5"></div>
+      </div>
+      <div class="pin-error" id="pinError"></div>
+      <div class="pin-keypad">
+        <button class="keypad-btn" data-key="1">1</button>
+        <button class="keypad-btn" data-key="2">2</button>
+        <button class="keypad-btn" data-key="3">3</button>
+        <button class="keypad-btn" data-key="4">4</button>
+        <button class="keypad-btn" data-key="5">5</button>
+        <button class="keypad-btn" data-key="6">6</button>
+        <button class="keypad-btn" data-key="7">7</button>
+        <button class="keypad-btn" data-key="8">8</button>
+        <button class="keypad-btn" data-key="9">9</button>
+        <button class="keypad-btn action" id="btnClear">Clear</button>
+        <button class="keypad-btn" data-key="0">0</button>
+        <button class="keypad-btn action" id="btnDel">⌫</button>
+      </div>
+    </div>
+
+    <!-- Action State Screen (Sleep / Restart / Shutdown Feedback) -->
+    <div id="actionStateView" class="state-view" style="display: none;">
+      <div class="state-icon-wrap" id="stateIconWrap">
+        <!-- Rendered dynamically -->
+      </div>
+      <div class="state-title" id="stateTitle">State Title</div>
+      <div class="state-desc" id="stateDesc">State description goes here.</div>
+      <div class="state-badge" id="stateBadge">
+        <span class="state-badge-dot" id="stateBadgeDot"></span>
+        <span id="stateBadgeText">STANDBY</span>
+      </div>
+      <div class="state-footer">
+        <button class="btn-state-action" id="btnStateAction">Reconnect when awake</button>
+      </div>
+    </div>
+
+    <!-- Main Dashboard View -->
+    <div id="mainDashboard" style="display: none; flex-direction: column; gap: 18px; width: 100%;">
+      <!-- Header with Desktop Icon + Desktop Name + Online Dot -->
+      <header class="app-header">
+        <div class="device-identity">
+          <div class="device-icon-wrap">
+            <svg class="device-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="2" y="3" width="20" height="14" rx="2"/>
+              <line x1="8" y1="21" x2="16" y2="21"/>
+              <line x1="12" y1="17" x2="12" y2="21"/>
+            </svg>
+          </div>
+          <div class="device-meta">
+            <div class="device-name" id="deviceName">DESKTOP-PC</div>
+            <div class="status-indicator" id="statusIndicator">
+              <span class="status-dot"></span>
+              <span id="statusLabel">ONLINE</span>
+            </div>
+          </div>
+        </div>
+        <button class="btn-refresh" id="btnRefresh" aria-label="Refresh telemetry">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+          </svg>
+        </button>
+      </header>
+
+      <!-- System Statusbar (Network + Battery Box UI) -->
+      <div class="system-statusbar">
+        <div class="network-badge">
+          <!-- Canonical Feather/Lucide Wi-Fi icon -->
+          <svg class="network-icon" id="networkIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M1.42 9a16 16 0 0 1 21.16 0"/>
+            <path d="M5 12.55a11 11 0 0 1 14.08 0"/>
+            <path d="M8.53 16.11a6 6 0 0 1 6.95 0"/>
+            <circle cx="12" cy="20" r="1" fill="currentColor"/>
+          </svg>
+          <div class="network-info">
+            <span class="network-name" id="networkName">Connected</span>
+            <span class="network-type" id="networkType">Wi-Fi</span>
+          </div>
+        </div>
+        <div class="battery-card">
+          <div class="battery-gauge">
+            <div class="battery-fill-wrap">
+              <div class="battery-fill" id="batteryFill" style="width: 100%;"></div>
+              <svg class="battery-lightning" id="batteryLightning" viewBox="0 0 24 24" style="display: none;">
+                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+              </svg>
+            </div>
+            <div class="battery-terminal"></div>
+          </div>
+          <span class="battery-percent-text" id="batteryPercentText">100%</span>
+        </div>
+      </div>
+
+      <!-- System Metrics: CPU, RAM, UPTIME Together -->
+      <section class="section-card">
+        <div class="section-title">System Metrics</div>
+        <div class="metrics-row-group">
+          <!-- CPU -->
+          <div class="metric-card">
+            <div class="metric-top">
+              <div class="metric-icon-wrap">
+                <svg class="metric-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="4" y="4" width="16" height="16" rx="2"/>
+                  <rect x="9" y="9" width="6" height="6"/>
+                  <line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/>
+                  <line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/>
+                  <line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="15" x2="23" y2="15"/>
+                  <line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="15" x2="4" y2="15"/>
+                </svg>
+                <span>CPU</span>
+              </div>
+              <span class="metric-value" id="cpuValue">--%</span>
+            </div>
+            <div class="meter-bar">
+              <div class="meter-fill" id="cpuMeter" style="width: 0%;"></div>
+            </div>
+          </div>
+
+          <!-- RAM -->
+          <div class="metric-card">
+            <div class="metric-top">
+              <div class="metric-icon-wrap">
+                <svg class="metric-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="2" y="5" width="20" height="14" rx="2"/>
+                  <line x1="6" y1="9" x2="6" y2="15"/><line x1="10" y1="9" x2="10" y2="15"/>
+                  <line x1="14" y1="9" x2="14" y2="15"/><line x1="18" y1="9" x2="18" y2="15"/>
+                </svg>
+                <span>RAM</span>
+              </div>
+              <span class="metric-value" id="ramValue">--%</span>
+            </div>
+            <div class="meter-bar">
+              <div class="meter-fill" id="ramMeter" style="width: 0%;"></div>
+            </div>
+            <div class="metric-sub" id="ramGb">-- / -- GB</div>
+          </div>
+
+          <!-- Uptime -->
+          <div class="metric-card">
+            <div class="metric-top">
+              <div class="metric-icon-wrap">
+                <svg class="metric-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="10"/>
+                  <polyline points="12 6 12 12 16 14"/>
+                </svg>
+                <span>Uptime</span>
+              </div>
+              <span class="metric-value uptime-text" id="uptimeValue">--</span>
+            </div>
+            <div class="metric-sub">Since boot</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Power Controls -->
+      <section class="section-card">
+        <div class="section-title">Power Controls</div>
+        <div class="controls-list">
+          <!-- Lock -->
+          <button class="btn-control" id="btnLock">
+            <div class="control-left">
+              <svg class="control-icon" id="lockIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+              </svg>
+              <div class="control-text">
+                <span class="control-name" id="lockName">Lock</span>
+                <span class="control-desc" id="lockDesc">Lock screen immediately</span>
+              </div>
+            </div>
+            <div id="lockRight">
+              <svg class="control-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+            </div>
+          </button>
+
+          <!-- Sleep -->
+          <button class="btn-control" id="btnSleep">
+            <div class="control-left">
+              <svg class="control-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+              </svg>
+              <div class="control-text">
+                <span class="control-name">Sleep</span>
+                <span class="control-desc">Enter low-power standby</span>
+              </div>
+            </div>
+            <svg class="control-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+          </button>
+
+          <!-- Restart -->
+          <button class="btn-control" id="btnRestart">
+            <div class="control-left">
+              <svg class="control-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="23 4 23 10 17 10"/>
+                <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+              </svg>
+              <div class="control-text">
+                <span class="control-name">Restart</span>
+                <span class="control-desc">Reboot Windows system</span>
+              </div>
+            </div>
+            <svg class="control-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+          </button>
+
+          <!-- Shut Down -->
+          <button class="btn-control danger" id="btnShutdown">
+            <div class="control-left">
+              <svg class="control-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>
+                <line x1="12" y1="2" x2="12" y2="12"/>
+              </svg>
+              <div class="control-text">
+                <span class="control-name">Shut Down</span>
+                <span class="control-desc">Power off laptop completely</span>
+              </div>
+            </div>
+            <svg class="control-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+          </button>
+        </div>
+      </section>
+
+    </div>
+  </div>
+
+  <!-- Confirmation Modal -->
+  <div class="modal-overlay" id="confirmModal">
+    <div class="modal-box">
+      <div class="modal-header" id="modalTitle">Confirm Action</div>
+      <div class="modal-desc" id="modalDesc">Are you sure you want to execute this command?</div>
+      <div class="modal-actions">
+        <button class="btn-modal btn-cancel" id="btnModalCancel">Cancel</button>
+        <button class="btn-modal confirm-primary" id="btnModalConfirm">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast-container" id="toast">
+    <span id="toastText">Action sent</span>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

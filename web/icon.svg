@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <rect width="512" height="512" rx="128" fill="#09090b"/>
+  <!-- Clean Desktop Monitor -->
+  <rect x="96" y="112" width="320" height="210" rx="18" fill="#18181b" stroke="#27272a" stroke-width="12"/>
+  <rect x="120" y="136" width="272" height="162" rx="10" fill="#0f0f12"/>
+  <!-- Green status dot inside -->
+  <circle cx="256" cy="217" r="22" fill="#22c55e"/>
+  <!-- Stand & Base -->
+  <path d="M220 322v46h72v-46" fill="none" stroke="#27272a" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  <line x1="168" y1="368" x2="344" y2="368" stroke="#27272a" stroke-width="14" stroke-linecap="round"/>
+</svg>

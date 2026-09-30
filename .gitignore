@@ -1,0 +1,25 @@
+# Executables and compiler artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.syso
+*.test
+
+# Sensitive user configuration and secrets
+config.json
+
+# Build directories
+bin/
+dist/
+
+# OS metadata
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# Temporary and log files
+*.log
+*.tmp
