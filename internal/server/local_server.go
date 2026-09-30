@@ -75,8 +75,18 @@ func GetLocalIPv4() string {
 	return "127.0.0.1"
 }
 
-// GetPairingURL generates the complete local pairing URL
+const DefaultCloudflareURL = "https://pc-remote-45t.pages.dev"
+
+// GetPairingURL generates the complete pairing URL pointing to your Cloudflare Pages PWA
 func (s *Server) GetPairingURL() string {
+	ip := GetLocalIPv4()
+	token := s.GetPairingToken()
+	return fmt.Sprintf("%s/#pair=%s&key=%s&lan=%s:%d&name=%s",
+		DefaultCloudflareURL, token, s.cfg.LaptopPubKey, ip, s.port, s.cfg.DeviceName)
+}
+
+// GetLocalPairingURL returns the direct local IP pairing URL
+func (s *Server) GetLocalPairingURL() string {
 	ip := GetLocalIPv4()
 	token := s.GetPairingToken()
 	return fmt.Sprintf("http://%s:%d/#pair=%s&key=%s&lan=%s:%d&name=%s",

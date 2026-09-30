@@ -175,7 +175,12 @@
         }
       })
       .catch((err) => {
-        pinError.textContent = err.message || 'Connection failed';
+        let msg = err.message || 'Connection failed';
+        if (window.location.protocol === 'https:' && config.lanHost) {
+          pinError.innerHTML = `${msg} — <a href="http://${config.lanHost}/" style="color:#22c55e;text-decoration:underline;">Switch to Direct LAN</a>`;
+        } else {
+          pinError.textContent = msg;
+        }
         enteredPin = '';
         updatePinDots();
       });
@@ -235,9 +240,7 @@
 
   // Decentralized Relay Pool
   const RELAYS = [
-    'wss://relay.damus.io',
-    'wss://nos.lol',
-    'wss://relay.primal.net'
+    'wss://relay.damus.io'
   ];
 
   let relaySockets = [];
