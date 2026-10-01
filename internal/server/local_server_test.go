@@ -29,7 +29,10 @@ func setupTestServer(t *testing.T) (*Server, *config.Config, *pairing.Manager) {
 	}
 	_ = cfg.SetPin("123456")
 
-	pairMgr := pairing.NewManager()
+	pairMgr, err := pairing.NewManager()
+	if err != nil {
+		t.Fatal(err)
+	}
 	replayGuard := protocol.NewReplayGuard(120)
 	handler := protocol.NewHandler(cfg, pairMgr, replayGuard)
 	srv := NewServer(cfg, nil, 8765, pairMgr, handler)
@@ -145,4 +148,57 @@ func TestServer_SanitizedStatus(t *testing.T) {
 	if _, exists := resp["telemetry"]; exists {
 		t.Fatal("SECURITY LEAK: telemetry leaked in /api/status!")
 	}
+}
+
+func TestServer_LANControlConcurrencyBounding(t *testing.T) {
+	srv, _, _ := setupTestServer(t)
+
+	// Set small concurrency limit of 2 for testing overload behavior
+	srv.SetControlConcurrency(2)
+
+	// Saturate the 2 concurrency slots manually
+	srv.controlSem <- struct{}{}
+	srv.controlSem <- struct{}{}
+
+	// Excess 3rd request to /api/control must fail fast with HTTP 429
+	reqControl := httptest.NewRequest(http.MethodPost, "/api/control", bytes.NewReader([]byte("{}")))
+	wControl := httptest.NewRecorder()
+	srv.ServeHTTP(wControl, reqControl)
+
+	if wControl.Code != http.StatusTooManyRequests {
+		t.Fatalf("Expected 429 Too Many Requests when saturated, got: %d", wControl.Code)
+	}
+
+	var errResp map[string]string
+	_ = json.Unmarshal(wControl.Body.Bytes(), &errResp)
+	if errResp["error"] == "" {
+		t.Fatal("Expected error message in 429 response")
+	}
+
+	// Crucial check: unrelated /api/status MUST NOT be blocked or throttled by /api/control saturation!
+	reqStatus := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	wStatus := httptest.NewRecorder()
+	srv.ServeHTTP(wStatus, reqStatus)
+
+	if wStatus.Code != http.StatusOK {
+		t.Fatalf("Unrelated /api/status must remain 200 OK during control saturation, got: %d", wStatus.Code)
+	}
+
+	// Release one slot and verify /api/control accepts requests again
+	<-srv.controlSem
+
+	// Send request now: should pass semaphore and fail on invalid payload (401), NOT 429
+	wControl2 := httptest.NewRecorder()
+	reqControl2 := httptest.NewRequest(http.MethodPost, "/api/control", bytes.NewReader([]byte("{}")))
+	srv.ServeHTTP(wControl2, reqControl2)
+
+	if wControl2.Code == http.StatusTooManyRequests {
+		t.Fatal("Request should have been accepted by semaphore after slot release")
+	}
+	if wControl2.Code != http.StatusUnauthorized {
+		t.Fatalf("Expected 401 Unauthorized for empty payload, got: %d", wControl2.Code)
+	}
+
+	// Clean up second held slot
+	<-srv.controlSem
 }

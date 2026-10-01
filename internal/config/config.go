@@ -10,17 +10,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
 )
 
 const (
-	Iterations        = 100000
-	MaxFailedAttempts = 5
-	LockoutDuration   = 3 * time.Minute
+	Iterations           = 100000
+	MaxFailedAttempts    = 5
+	LockoutDuration      = 3 * time.Minute
+	DefaultFlushInterval = 30 * time.Second
 )
 
 // PBKDF2-SHA256 pure Go implementation without external dependencies
@@ -69,6 +73,10 @@ type DeviceInfo struct {
 type Config struct {
 	mu                 sync.RWMutex
 	filePath           string
+	isDirty            bool
+	lastSaveTime       time.Time
+	flushInterval      time.Duration
+	flushTimer         *time.Timer
 	PinHash            string                `json:"pinHash"`
 	PinSalt            string                `json:"pinSalt"`
 	DeviceName         string                `json:"deviceName"`
@@ -98,6 +106,7 @@ func LoadOrCreate(baseDir string) (*Config, error) {
 	cfgFile := filepath.Join(baseDir, "config.json")
 	cfg := &Config{
 		filePath:          cfgFile,
+		flushInterval:     DefaultFlushInterval,
 		AuthorizedDevices: make(map[string]DeviceInfo),
 	}
 
@@ -295,16 +304,73 @@ func (c *Config) RevokeDevice(pubKey string) error {
 	return nil
 }
 
-// UpdateDeviceLastSeen refreshes the last active timestamp for an authorized device
+// SetFlushInterval overrides the debounce duration for flushing LastSeen updates (useful for tests)
+func (c *Config) SetFlushInterval(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.flushInterval = d
+}
+
+// UpdateDeviceLastSeen refreshes the in-memory last active timestamp immediately and debounces disk writes.
 func (c *Config) UpdateDeviceLastSeen(pubKey string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if dev, ok := c.AuthorizedDevices[pubKey]; ok {
-		dev.LastSeen = time.Now()
-		c.AuthorizedDevices[pubKey] = dev
-		_ = c.saveLocked()
+	dev, ok := c.AuthorizedDevices[pubKey]
+	if !ok {
+		return
 	}
+	dev.LastSeen = time.Now()
+	c.AuthorizedDevices[pubKey] = dev
+	c.isDirty = true
+
+	interval := c.flushInterval
+	if interval <= 0 {
+		interval = DefaultFlushInterval
+	}
+
+	// If enough time has elapsed since the last save, flush immediately
+	if time.Since(c.lastSaveTime) >= interval {
+		if c.flushTimer != nil {
+			c.flushTimer.Stop()
+			c.flushTimer = nil
+		}
+		_ = c.saveLocked()
+		return
+	}
+
+	// Schedule a debounce timer if not already pending
+	if c.flushTimer == nil {
+		remaining := interval - time.Since(c.lastSaveTime)
+		if remaining <= 0 {
+			remaining = interval
+		}
+		c.flushTimer = time.AfterFunc(remaining, func() {
+			_ = c.Flush()
+		})
+	}
+}
+
+// Flush synchronously writes any pending dirty configuration to disk.
+func (c *Config) Flush() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.flushTimer != nil {
+		c.flushTimer.Stop()
+		c.flushTimer = nil
+	}
+
+	if !c.isDirty {
+		return nil
+	}
+
+	return c.saveLocked()
+}
+
+// Close flushes any pending writes and cancels any active timer.
+func (c *Config) Close() error {
+	return c.Flush()
 }
 
 // IsDeviceAuthorized strictly checks if a pubkey is explicitly authorized
@@ -327,9 +393,68 @@ func (c *Config) Save() error {
 }
 
 func (c *Config) saveLocked() error {
+	if c.flushTimer != nil {
+		c.flushTimer.Stop()
+		c.flushTimer = nil
+	}
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(c.filePath, data, 0600)
+	err = os.WriteFile(c.filePath, data, 0600)
+	if err == nil {
+		c.isDirty = false
+		c.lastSaveTime = time.Now()
+	}
+	return err
 }
+
+// GetServiceConfigDir returns the machine-wide directory for PC Remote service state
+func GetServiceConfigDir() string {
+	progData := os.Getenv("ProgramData")
+	if progData == "" {
+		progData = `C:\ProgramData`
+	}
+	return filepath.Join(progData, "PC Remote")
+}
+
+// GetServiceConfigPath returns the absolute path to the service configuration file
+func GetServiceConfigPath() string {
+	return filepath.Join(GetServiceConfigDir(), "config.json")
+}
+
+// SetupDirectorySecurity ensures the specified directory exists and has restricted ACLs
+func SetupDirectorySecurity(dir string) error {
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return err
+	}
+	// Only apply machine ACLs when managing the authoritative service config directory
+	if strings.EqualFold(filepath.Clean(dir), filepath.Clean(GetServiceConfigDir())) {
+		cmd := exec.Command("icacls.exe", dir, "/grant:r", "SYSTEM:(OI)(CI)F", "Administrators:(OI)(CI)F")
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		_ = cmd.Run()
+	}
+	return nil
+}
+
+// MigrateKey securely updates the private key in-memory, re-encrypts with DPAPI, and saves to disk
+func (c *Config) MigrateKey(privateKey string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	derivedPub, err := nostr.GetPublicKey(privateKey)
+	if err != nil {
+		return fmt.Errorf("invalid Nostr private key: %w", err)
+	}
+
+	encBytes, err := EncryptDPAPI([]byte(privateKey))
+	if err != nil {
+		return fmt.Errorf("failed to encrypt private key with service DPAPI: %w", err)
+	}
+
+	c.LaptopPrivKey = privateKey
+	c.LaptopPubKey = derivedPub
+	c.LaptopPrivKeyDPAPI = base64.StdEncoding.EncodeToString(encBytes)
+	return c.saveLocked()
+}
+

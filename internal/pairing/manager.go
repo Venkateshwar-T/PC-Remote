@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -23,30 +24,44 @@ type Manager struct {
 	consumed  bool
 }
 
-// NewManager initializes a new pairing manager with an active pairing token.
-func NewManager() *Manager {
-	m := &Manager{}
-	m.Regenerate()
-	return m
+// generateSecureToken derives a 128-bit pairing token exclusively from OS cryptographically secure entropy.
+func generateSecureToken() (string, error) {
+	b := make([]byte, TokenEntropyBytes)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("failed to read cryptographically secure entropy: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// NewManager initializes a new pairing manager with a cryptographically secure pairing token.
+// Fails closed if secure OS randomness is unavailable.
+func NewManager() (*Manager, error) {
+	token, err := generateSecureToken()
+	if err != nil {
+		return nil, err
+	}
+	return &Manager{
+		token:     token,
+		expiresAt: time.Now().Add(TokenLifetime),
+		consumed:  false,
+	}, nil
 }
 
 // Regenerate generates a fresh 128-bit cryptographically secure pairing token with 5-minute expiry.
-func (m *Manager) Regenerate() string {
+// Fails closed if secure OS randomness is unavailable.
+func (m *Manager) Regenerate() (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	b := make([]byte, TokenEntropyBytes)
-	if _, err := rand.Read(b); err != nil {
-		// Fallback to timestamp + random if needed, though rand.Read rarely fails
-		for i := range b {
-			b[i] = byte(time.Now().UnixNano() >> (i * 8))
-		}
+	newToken, err := generateSecureToken()
+	if err != nil {
+		return "", err
 	}
 
-	m.token = hex.EncodeToString(b)
+	m.token = newToken
 	m.expiresAt = time.Now().Add(TokenLifetime)
 	m.consumed = false
-	return m.token
+	return m.token, nil
 }
 
 // GetToken returns the current pairing token (used for generating QR code and pairing link).
@@ -118,13 +133,15 @@ func (m *Manager) ValidateAndConsume(candidate string) (bool, string) {
 		return false, "Invalid pairing token"
 	}
 
-	// Token is valid! Mark consumed immediately so it can never be used again
-	m.consumed = true
+	// Generate NEW secure token first BEFORE mutating state!
+	newToken, err := generateSecureToken()
+	if err != nil {
+		return false, "Internal security failure: cannot generate secure rotation token"
+	}
 
-	// Automatically regenerate a fresh token for subsequent pairing cycles
-	b := make([]byte, TokenEntropyBytes)
-	_, _ = rand.Read(b)
-	m.token = hex.EncodeToString(b)
+	// Token is valid and new token generated! Mark consumed and install new token
+	m.consumed = true
+	m.token = newToken
 	m.expiresAt = time.Now().Add(TokenLifetime)
 	m.consumed = false
 

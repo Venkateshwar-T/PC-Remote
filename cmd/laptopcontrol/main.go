@@ -1,10 +1,11 @@
 package main
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -12,14 +13,11 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/nbd-wtf/go-nostr"
 	"laptopcontrol/internal/config"
-	"laptopcontrol/internal/pairing"
-	"laptopcontrol/internal/protocol"
-	"laptopcontrol/internal/qr"
-	"laptopcontrol/internal/relay"
-	"laptopcontrol/internal/server"
+	"laptopcontrol/internal/ipc"
+	"laptopcontrol/internal/service"
 	"laptopcontrol/internal/tray"
-	"laptopcontrol/web"
 )
 
 var (
@@ -37,44 +35,138 @@ var (
 	procSetWindowPos             = modUser32.NewProc("SetWindowPos")
 	procSwitchToThisWindow       = modUser32.NewProc("SwitchToThisWindow")
 	procAllowSetForegroundWindow = modUser32.NewProc("AllowSetForegroundWindow")
+	procAttachConsole            = modKernel32.NewProc("AttachConsole")
 )
 
+const ATTACH_PARENT_PROCESS = ^uintptr(0)
+
 func main() {
+	// If launched from a console/terminal, attach to parent console so CLI output is visible
+	ret, _, _ := procAttachConsole.Call(ATTACH_PARENT_PROCESS)
+	if ret != 0 {
+		os.Stdout = os.NewFile(uintptr(syscall.Stdout), "/dev/stdout")
+		os.Stderr = os.NewFile(uintptr(syscall.Stderr), "/dev/stderr")
+		log.SetOutput(os.Stderr)
+	}
+
+	// Parse CLI arguments
+	if len(os.Args) > 1 {
+		cmd := os.Args[1]
+		switch cmd {
+		case "service", "-service", "--service":
+			runServiceCommand(os.Args[2:])
+			return
+		case "tray", "-tray", "--tray":
+			runTrayCommand(os.Args[2:])
+			return
+		case "install":
+			exePath, err := os.Executable()
+			if err != nil {
+				log.Fatalf("Failed to resolve executable path: %v", err)
+			}
+			if err := service.InstallService(exePath); err != nil {
+				log.Fatalf("Failed to install Windows service: %v", err)
+			}
+			fmt.Println("PC Remote background service installed successfully.")
+			return
+		case "uninstall":
+			if err := service.UninstallService(); err != nil {
+				log.Fatalf("Failed to uninstall Windows service: %v", err)
+			}
+			fmt.Println("PC Remote background service uninstalled successfully.")
+			return
+		case "start":
+			if err := service.StartService(); err != nil {
+				log.Fatalf("Failed to start Windows service: %v", err)
+			}
+			fmt.Println("PC Remote background service started.")
+			return
+		case "stop":
+			if err := service.StopService(); err != nil {
+				log.Fatalf("Failed to stop Windows service: %v", err)
+			}
+			fmt.Println("PC Remote background service stopped.")
+			return
+		case "help", "-h", "--help":
+			printUsage()
+			return
+		}
+	}
+
+	// If invoked without subcommands, detect environment:
+	// If running under Windows Service Control Manager -> run as service
+	// If running in interactive desktop session -> default to interactive tray
+	isSvc, _ := service.IsServiceSession()
+	if isSvc {
+		runServiceCommand(nil)
+		return
+	}
+
+	runTrayCommand(os.Args[1:])
+}
+
+func printUsage() {
+	fmt.Println("PC Remote - Remote Control Daemon & Desktop Tray")
+	fmt.Println("\nUsage:")
+	fmt.Println("  PC-Remote.exe [command] [options]")
+	fmt.Println("\nCommands:")
+	fmt.Println("  service          Run as Windows background service (SCM entry point)")
+	fmt.Println("    -port=8765     Local HTTP server port (default: 8765)")
+	fmt.Println("    -debug         Run service in foreground console for debugging")
+	fmt.Println("  tray             Run interactive desktop system tray & pairing UI")
+	fmt.Println("    -silent        Start minimized in system tray without opening QR window")
+	fmt.Println("  install          Register service with Windows Service Control Manager")
+	fmt.Println("  uninstall        Remove service from Windows Service Control Manager")
+	fmt.Println("  start            Start installed Windows background service")
+	fmt.Println("  stop             Stop running Windows background service")
+}
+
+func runServiceCommand(args []string) {
+	fs := flag.NewFlagSet("service", flag.ExitOnError)
+	port := fs.Int("port", 8765, "Local HTTP server port")
+	debug := fs.Bool("debug", false, "Run service in foreground console")
+	_ = fs.Parse(args)
+
+	isSvc, _ := service.IsServiceSession()
+	if *debug || !isSvc {
+		log.Printf("[Service] Running PC Remote daemon in debug console mode on port %d...", *port)
+		daemon := service.NewDaemon(*port, ipc.PipeName, config.GetServiceConfigDir())
+		if err := daemon.Start(); err != nil {
+			log.Fatalf("Failed to start daemon: %v", err)
+		}
+
+		// Handle Ctrl+C for clean exit in debug console
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+		<-sigChan
+
+		log.Println("[Service] Interrupted, shutting down...")
+		daemon.Stop()
+		return
+	}
+
+	// Normal SCM Service Execution
+	ws := service.NewWindowsService(*port, ipc.PipeName, config.GetServiceConfigDir())
+	if err := service.RunAsService(service.ServiceName, ws); err != nil {
+		log.Fatalf("Service execution failure: %v", err)
+	}
+}
+
+func runTrayCommand(args []string) {
 	// Set explicit application user model ID for Windows taskbar branding
 	appId, _ := syscall.UTF16PtrFromString("PCRemote.App")
 	procSetAppUserModelID.Call(uintptr(unsafe.Pointer(appId)))
 
-	flagPort := flag.Int("port", 8765, "Local HTTP server port")
-	flagPin := flag.String("set-pin", "", "Set a new 6-digit master PIN")
-	flagReset := flag.Bool("reset", false, "Reset configuration and launch first-time setup wizard")
-	flagSilent := flag.Bool("silent", false, "Start minimized in system tray without opening QR window")
-	flag.Parse()
+	fs := flag.NewFlagSet("tray", flag.ExitOnError)
+	flagSilent := fs.Bool("silent", false, "Start minimized in system tray without opening QR window")
+	_ = fs.Parse(args)
 
-	// Determine base directory
-	exePath, err := os.Executable()
-	if err != nil {
-		exePath = "."
-	}
-	baseDir := filepath.Dir(exePath)
-
-	// If reset requested, signal any existing instance to terminate first
-	if *flagReset {
-		className, _ := syscall.UTF16PtrFromString("PCRemoteWindowClass")
-		hwnd, _, _ := procFindWindowW.Call(uintptr(unsafe.Pointer(className)), 0)
-		if hwnd != 0 {
-			const WM_DESTROY = 0x0002
-			procPostMessageW.Call(hwnd, WM_DESTROY, 0, 0)
-			time.Sleep(300 * time.Millisecond)
-		}
-		_ = os.Remove(filepath.Join(baseDir, "config.json"))
-	}
-
-	// Single Instance Lock: Ensure only one instance runs at any time
-	mutexName, _ := syscall.UTF16PtrFromString("Local\\PCRemote_SingleInstance_Mutex")
+	// Single Instance Lock: Ensure only one tray instance runs per user session
+	mutexName, _ := syscall.UTF16PtrFromString("Local\\PCRemote_Tray_SingleInstance_Mutex")
 	hMutex, _, errMutex := procCreateMutexW.Call(0, 1, uintptr(unsafe.Pointer(mutexName)))
 	const ERROR_ALREADY_EXISTS = 183
 	if errno, ok := errMutex.(syscall.Errno); ok && errno == ERROR_ALREADY_EXISTS {
-		// An instance is already running: bring its pairing window to the foreground
+		// Another tray instance is running; restore its pairing window
 		className, _ := syscall.UTF16PtrFromString("PCRemoteWindowClass")
 		hwnd, _, _ := procFindWindowW.Call(uintptr(unsafe.Pointer(className)), 0)
 		if hwnd != 0 {
@@ -103,103 +195,97 @@ func main() {
 		defer procCloseHandle.Call(hMutex)
 	}
 
-	// Load configuration (with DPAPI key protection & legacy migration)
-	cfg, err := config.LoadOrCreate(baseDir)
+	exePath, err := os.Executable()
 	if err != nil {
-		log.Fatalf("Failed to initialize configuration: %v", err)
+		exePath = "."
+	}
+	baseDir := filepath.Dir(exePath)
+
+	ipcClient := ipc.NewClient(ipc.PipeName)
+	defer ipcClient.Close()
+
+	// Wait up to 3 seconds for service to respond if it was just started
+	_ = ipcClient.Connect(3 * time.Second)
+
+	// Execute legacy migration check: decrypt old user DPAPI key and transfer via local pipe to service
+	checkAndMigrateLegacyConfig(ipcClient, baseDir)
+
+	// Check device name and PIN status from service
+	deviceName := "Windows PC"
+	status, err := ipcClient.GetStatus()
+	if err == nil && status.DeviceName != "" {
+		deviceName = status.DeviceName
 	}
 
-	if *flagPin != "" {
-		pin := *flagPin
-		if len(pin) != 6 || !isNumeric(pin) {
-			log.Fatalf("Invalid PIN: Master PIN must be exactly 6 numeric digits (0-9)")
-		}
-		if err := cfg.SetPin(pin); err != nil {
-			log.Fatalf("Failed to update PIN: %v", err)
-		}
-		fmt.Printf("Master PIN successfully updated to: %s\n", pin)
-		return
-	}
-
-	// First-Time Setup: If no Master PIN has been established, prompt user on desktop
-	if !cfg.HasPin() {
-		pin, ok := tray.PromptInitialPinSetup(cfg.DeviceName)
-		if !ok || len(pin) != 6 || !isNumeric(pin) {
-			log.Println("[Setup] Initial PIN setup was cancelled. Exiting.")
+	pinStat, err := ipcClient.GetPinStatus()
+	if err == nil && !pinStat.IsSet {
+		// First-Time Setup: Prompt user to set initial Master PIN
+		pin, ok := tray.PromptInitialPinSetup(deviceName)
+		if !ok || len(pin) != 6 || !isAllDigits(pin) {
+			log.Println("[Setup] Initial PIN setup was cancelled. Exiting tray.")
 			return
 		}
-		if err := cfg.SetPin(pin); err != nil {
-			log.Fatalf("Failed to save initial Master PIN: %v", err)
+		if _, err := ipcClient.SetPin("", pin); err != nil {
+			log.Printf("[Setup] Failed to save initial PIN: %v", err)
 		}
 	}
 
-	// Initialize thread-safe Pairing Token Manager & Hardened Replay Guard
-	pairMgr := pairing.NewManager()
-	replayGuard := protocol.NewReplayGuard(120)
-
-	// Initialize Unified Cryptographic Protocol Handler (shared between LAN & Nostr)
-	protoHandler := protocol.NewHandler(cfg, pairMgr, replayGuard)
-
-	// Initialize local HTTP server with unified envelope handler
-	localSrv := server.NewServer(cfg, web.Assets, *flagPort, pairMgr, protoHandler)
-	httpServer := &http.Server{
-		Addr:         fmt.Sprintf("0.0.0.0:%d", *flagPort),
-		Handler:      localSrv,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  30 * time.Second,
-	}
-
-	// Start local HTTP server
-	go func() {
-		log.Printf("[Server] Local PWA server listening on http://0.0.0.0:%d", *flagPort)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("[Server] Error: %v", err)
-		}
-	}()
-
-	// Initialize and start decentralized Nostr E2EE relay client
-	relayClient := relay.NewClient(cfg, nil, protoHandler)
-	relayClient.Start()
-
-	// Display pairing information
-	pairingUrl := localSrv.GetPairingURL()
-	fmt.Println("\n========================================================")
-	fmt.Printf("   PC Remote v2.0 (Nostr E2EE Production Edition)\n")
-	fmt.Printf("   Device: %s\n", cfg.DeviceName)
-	fmt.Printf("   Nostr Public Key: %s\n", cfg.LaptopPubKey)
-	fmt.Printf("   Pairing URL: %s\n", pairingUrl)
-	fmt.Println("========================================================")
-	fmt.Println("\nScan with your phone to pair:")
-
-	ansiQR := qr.GenerateTerminalANSI(pairingUrl)
-	if ansiQR != "" {
-		fmt.Println(ansiQR)
-	}
-
-	// Initialize Native System Tray and Dark Pairing Window
-	trayMgr := tray.NewManager(cfg, pairingUrl, *flagSilent, func() {
-		log.Println("[Shutdown] Cleaning up services...")
-		relayClient.Stop()
-		httpServer.Close()
-		time.Sleep(300 * time.Millisecond)
-		os.Exit(0)
-	})
-
-	// Handle graceful shutdown via Ctrl+C / SIGINT
-	go func() {
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-		<-sigChan
-		fmt.Println("\nShutting down PC Remote cleanly...")
-		trayMgr.Close()
-	}()
-
-	// Start native message loop (0% CPU, handles tray icon and pairing window)
+	// Initialize and run interactive Win32 desktop tray manager
+	trayMgr := tray.NewManager(ipcClient, deviceName, *flagSilent, nil)
 	trayMgr.Run()
 }
 
-func isNumeric(s string) bool {
+func checkAndMigrateLegacyConfig(client *ipc.Client, legacyDir string) {
+	legacyFile := filepath.Join(legacyDir, "config.json")
+	data, err := os.ReadFile(legacyFile)
+	if err != nil {
+		return // No legacy config file found
+	}
+
+	var disk struct {
+		LaptopPrivKeyDPAPI string `json:"laptopPrivKeyEncrypted"`
+		LaptopPrivKey      string `json:"laptopPrivKey"`
+	}
+	if err := json.Unmarshal(data, &disk); err != nil {
+		return
+	}
+
+	var plainKey string
+	if disk.LaptopPrivKeyDPAPI != "" {
+		cipherBytes, err := base64.StdEncoding.DecodeString(disk.LaptopPrivKeyDPAPI)
+		if err == nil {
+			plainBytes, errDec := config.DecryptDPAPI(cipherBytes)
+			if errDec == nil && len(plainBytes) > 0 {
+				plainKey = string(plainBytes)
+			}
+		}
+	}
+	if plainKey == "" && disk.LaptopPrivKey != "" {
+		plainKey = disk.LaptopPrivKey
+	}
+
+	if plainKey == "" {
+		return
+	}
+
+	// Verify key validity
+	if _, err := nostr.GetPublicKey(plainKey); err != nil {
+		return
+	}
+
+	// Send over local IPC to service
+	res, err := client.MigrateLegacyKey(plainKey)
+	if err == nil && res.Success {
+		log.Println("[Migration] Successfully migrated legacy cryptographic identity to background service")
+		// Safely rename obsolete file so it is never migrated twice
+		_ = os.Rename(legacyFile, legacyFile+".migrated")
+	}
+}
+
+func isAllDigits(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
 	for _, c := range s {
 		if c < '0' || c > '9' {
 			return false

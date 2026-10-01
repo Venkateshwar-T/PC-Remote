@@ -1,18 +1,31 @@
 package pairing
 
 import (
+	"encoding/hex"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func TestPairingManager_ScenarioA_ValidToken(t *testing.T) {
-	mgr := NewManager()
+// Scenario A: token has 32 hex characters and normal generation succeeds
+func TestPairingManager_ScenarioA_ValidTokenGeneration(t *testing.T) {
+	mgr, err := NewManager()
+	if err != nil {
+		t.Fatalf("failed to initialize pairing manager: %v", err)
+	}
 	token := mgr.GetToken()
 
 	if len(token) != 32 {
 		t.Fatalf("expected 32 hex chars (128 bits), got %d (%s)", len(token), token)
+	}
+
+	rawBytes, errHex := hex.DecodeString(token)
+	if errHex != nil {
+		t.Fatalf("expected valid hex string, got error: %v", errHex)
+	}
+	if len(rawBytes) != 16 {
+		t.Fatalf("expected 16 bytes (128 bits) of entropy, got %d", len(rawBytes))
 	}
 
 	ok, errMsg := mgr.ValidateAndConsume(token)
@@ -21,8 +34,44 @@ func TestPairingManager_ScenarioA_ValidToken(t *testing.T) {
 	}
 }
 
-func TestPairingManager_ScenarioB_ExpiredToken(t *testing.T) {
-	mgr := NewManager()
+// Scenario B: token rotation via Regenerate() succeeds and changes token
+func TestPairingManager_ScenarioB_RegenerateRotation(t *testing.T) {
+	mgr, err := NewManager()
+	if err != nil {
+		t.Fatalf("failed to initialize pairing manager: %v", err)
+	}
+	tokenA := mgr.GetToken()
+
+	tokenB, errRegen := mgr.Regenerate()
+	if errRegen != nil {
+		t.Fatalf("Regenerate failed: %v", errRegen)
+	}
+	if len(tokenB) != 32 {
+		t.Fatalf("expected rotated token to have 32 hex chars, got %d", len(tokenB))
+	}
+	if tokenA == tokenB {
+		t.Fatal("Regenerate must produce a fresh token distinct from tokenA")
+	}
+
+	// Token A should no longer validate
+	okA, _ := mgr.Validate(tokenA)
+	if okA {
+		t.Fatal("tokenA must not validate after Regenerate")
+	}
+
+	// Token B should validate
+	okB, _ := mgr.Validate(tokenB)
+	if !okB {
+		t.Fatal("tokenB must validate after Regenerate")
+	}
+}
+
+// Scenario C: expired token is rejected
+func TestPairingManager_ScenarioC_ExpiredToken(t *testing.T) {
+	mgr, err := NewManager()
+	if err != nil {
+		t.Fatalf("failed to initialize pairing manager: %v", err)
+	}
 	token := mgr.GetToken()
 
 	// Simulate expired token by rewinding expiresAt into the past
@@ -39,8 +88,12 @@ func TestPairingManager_ScenarioB_ExpiredToken(t *testing.T) {
 	}
 }
 
-func TestPairingManager_ScenarioC_WrongToken(t *testing.T) {
-	mgr := NewManager()
+// Scenario D: wrong token is rejected
+func TestPairingManager_ScenarioD_WrongToken(t *testing.T) {
+	mgr, err := NewManager()
+	if err != nil {
+		t.Fatalf("failed to initialize pairing manager: %v", err)
+	}
 	wrongToken := "0123456789abcdef0123456789abcdef"
 
 	ok, errMsg := mgr.ValidateAndConsume(wrongToken)
@@ -52,8 +105,12 @@ func TestPairingManager_ScenarioC_WrongToken(t *testing.T) {
 	}
 }
 
-func TestPairingManager_ScenarioD_TokenConsumedImmediately(t *testing.T) {
-	mgr := NewManager()
+// Scenario E: token consumed immediately and automatically rotated
+func TestPairingManager_ScenarioE_TokenConsumedAndRotated(t *testing.T) {
+	mgr, err := NewManager()
+	if err != nil {
+		t.Fatalf("failed to initialize pairing manager: %v", err)
+	}
 	initialToken := mgr.GetToken()
 
 	ok, _ := mgr.ValidateAndConsume(initialToken)
@@ -66,30 +123,29 @@ func TestPairingManager_ScenarioD_TokenConsumedImmediately(t *testing.T) {
 	if newToken == initialToken {
 		t.Fatal("new token should not equal the consumed token")
 	}
-}
-
-func TestPairingManager_ScenarioE_ReuseOfConsumedTokenRejected(t *testing.T) {
-	mgr := NewManager()
-	token := mgr.GetToken()
-
-	// First use: must succeed
-	ok1, _ := mgr.ValidateAndConsume(token)
-	if !ok1 {
-		t.Fatal("first consumption should succeed")
+	if len(newToken) != 32 {
+		t.Fatalf("expected 32 hex chars for rotated token, got %d", len(newToken))
 	}
 
-	// Second use with same token: MUST fail
-	ok2, errMsg2 := mgr.ValidateAndConsume(token)
-	if ok2 {
+	// Reuse of old token must be rejected
+	okReuse, _ := mgr.ValidateAndConsume(initialToken)
+	if okReuse {
 		t.Fatal("reuse of consumed token must be rejected")
 	}
-	if errMsg2 != "Invalid pairing token" {
-		t.Logf("Got expected rejection: %s", errMsg2)
+
+	// New token must be unconsumed and valid
+	okNew, _ := mgr.ValidateAndConsume(newToken)
+	if !okNew {
+		t.Fatal("new rotated token must be consumable")
 	}
 }
 
+// Scenario F: concurrent pairing attempts allow exactly 1 consumption
 func TestPairingManager_ScenarioF_ConcurrentPairingAttempts(t *testing.T) {
-	mgr := NewManager()
+	mgr, err := NewManager()
+	if err != nil {
+		t.Fatalf("failed to initialize pairing manager: %v", err)
+	}
 	targetToken := mgr.GetToken()
 
 	concurrency := 20

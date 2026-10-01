@@ -16,6 +16,10 @@
   let isLocked = true;
   let enteredPin = '';
   let isConnected = false;
+  let isPcOnline = false;
+  let consecutiveFailures = 0;
+  let lastSeenTime = null;
+  let lastTelemetryData = null;
   let pendingAction = null;
   let pollInterval = null;
 
@@ -37,6 +41,7 @@
   const deviceName = document.getElementById('deviceName');
   const statusIndicator = document.getElementById('statusIndicator');
   const statusLabel = document.getElementById('statusLabel');
+  const statusSub = document.getElementById('statusSub');
   const btnRefresh = document.getElementById('btnRefresh');
 
   // Network & Battery UI
@@ -80,6 +85,7 @@
   const stateBadgeDot = document.getElementById('stateBadgeDot');
   const stateBadgeText = document.getElementById('stateBadgeText');
   const btnStateAction = document.getElementById('btnStateAction');
+  const btnStateDismiss = document.getElementById('btnStateDismiss');
   let reconnectTimer = null;
 
   // Multi-Relay Pool (Public Nostr Relays)
@@ -289,15 +295,149 @@
     setTimeout(() => toast.classList.remove('active'), 3200);
   }
 
+  function getStorage() {
+    try {
+      if (typeof window !== 'undefined' && window.sessionStorage) return window.sessionStorage;
+    } catch (e) {}
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) return window.localStorage;
+    } catch (e) {}
+    return null;
+  }
+
+  function saveActionState(actState) {
+    const s = getStorage();
+    if (s && actState) {
+      try { s.setItem('pcremote_action_state', JSON.stringify(actState)); } catch (e) {}
+    }
+  }
+
+  function loadActionState() {
+    const s = getStorage();
+    if (s) {
+      try {
+        const raw = s.getItem('pcremote_action_state');
+        if (raw) return JSON.parse(raw);
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  function clearActionState() {
+    const s = getStorage();
+    if (s) {
+      try { s.removeItem('pcremote_action_state'); } catch (e) {}
+    }
+  }
+
+  function saveLastTelemetry(data) {
+    const s = getStorage();
+    if (s && data) {
+      try {
+        s.setItem('pcremote_last_telemetry', JSON.stringify({
+          data: data,
+          lastSeen: Date.now()
+        }));
+      } catch (e) {}
+    }
+  }
+
+  function loadLastTelemetry() {
+    const s = getStorage();
+    if (s) {
+      try {
+        const raw = s.getItem('pcremote_last_telemetry');
+        if (raw) return JSON.parse(raw);
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  function formatTime(timestamp) {
+    if (!timestamp) return '';
+    try {
+      return new Date(timestamp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function setControlsEnabled(enabled) {
+    if (btnLock) {
+      if (lastTelemetryData && lastTelemetryData.isLocked) {
+        btnLock.disabled = true;
+      } else {
+        btnLock.disabled = !enabled;
+      }
+    }
+    if (btnSleep) btnSleep.disabled = !enabled;
+    if (btnRestart) btnRestart.disabled = !enabled;
+    if (btnShutdown) btnShutdown.disabled = !enabled;
+  }
+
   function setStatus(state, text) {
     if (state === 'online') {
       statusIndicator.className = 'status-indicator';
-      statusLabel.textContent = text || 'ONLINE';
+      statusLabel.textContent = text || 'CONNECTED';
+      isPcOnline = true;
       isConnected = true;
+      setControlsEnabled(true);
+      if (statusSub) statusSub.style.display = 'none';
+    } else if (state === 'connecting') {
+      statusIndicator.className = 'status-indicator connecting';
+      statusLabel.textContent = text || 'CONNECTING...';
+      isPcOnline = false;
+      isConnected = false;
+      setControlsEnabled(false);
+      if (statusSub) {
+        if (lastSeenTime) {
+          statusSub.textContent = 'Last online at ' + formatTime(lastSeenTime);
+          statusSub.style.display = 'block';
+        } else {
+          statusSub.style.display = 'none';
+        }
+      }
     } else {
       statusIndicator.className = 'status-indicator offline';
       statusLabel.textContent = text || 'OFFLINE';
+      isPcOnline = false;
       isConnected = false;
+      setControlsEnabled(false);
+      if (statusSub) {
+        if (lastSeenTime) {
+          statusSub.textContent = 'Last online at ' + formatTime(lastSeenTime);
+          statusSub.style.display = 'block';
+        } else {
+          statusSub.style.display = 'none';
+        }
+      }
+    }
+  }
+
+  function restoreCachedTelemetry() {
+    const cached = loadLastTelemetry();
+    if (cached) {
+      if (cached.lastSeen) {
+        lastSeenTime = cached.lastSeen;
+        if (statusSub && !isPcOnline) {
+          statusSub.textContent = 'Last online at ' + formatTime(lastSeenTime);
+          statusSub.style.display = 'block';
+        }
+      }
+      if (cached.data) {
+        lastTelemetryData = cached.data;
+        if (cached.data.battery !== undefined) {
+          const pct = Math.min(100, Math.max(0, cached.data.battery));
+          if (batteryPercentText) batteryPercentText.textContent = `${pct}%`;
+          if (batteryFill) {
+            batteryFill.style.width = `${pct}%`;
+            if (pct <= 20) batteryFill.className = 'battery-fill red';
+            else if (pct <= 40) batteryFill.className = 'battery-fill amber';
+            else batteryFill.className = 'battery-fill';
+          }
+        }
+        if (cached.data.deviceName && deviceName) deviceName.textContent = cached.data.deviceName;
+      }
     }
   }
 
@@ -426,8 +566,15 @@
         pinView.style.display = 'flex';
       } else {
         pinView.style.display = 'none';
-        mainDashboard.style.display = 'flex';
-        startTelemetryLoop();
+        const savedAction = loadActionState();
+        if (savedAction && savedAction.action && (Date.now() - (savedAction.timestamp || 0) < 30 * 60 * 1000)) {
+          showActionState(savedAction.action);
+        } else {
+          mainDashboard.style.display = 'flex';
+          setStatus('connecting', 'CONNECTING...');
+          restoreCachedTelemetry();
+          startTelemetryLoop();
+        }
       }
 
       initRelays();
@@ -460,7 +607,9 @@
       relaySockets.set(url, ws);
 
       ws.onopen = () => {
-        setStatus('online', 'CONNECTED');
+        if (!isPcOnline) {
+          setStatus('connecting', 'CONNECTING...');
+        }
         if (config.phonePubkey) {
           const subId = 'sub_' + Math.random().toString(36).substring(2, 8);
           const filter = {
@@ -492,7 +641,7 @@
             break;
           }
         }
-        if (!anyConnected) {
+        if (!anyConnected && !isPcOnline) {
           setStatus('offline', 'DISCONNECTED');
         }
         if (config.isPaired || config.pairingToken) {
@@ -537,6 +686,10 @@
         const { resolve, timer } = pendingRequests.get(data.id);
         clearTimeout(timer);
         pendingRequests.delete(data.id);
+        isPcOnline = true;
+        consecutiveFailures = 0;
+        lastSeenTime = Date.now();
+        setStatus('online', 'CONNECTED');
         resolve(data);
       }
     } catch (e) {}
@@ -612,6 +765,9 @@
               const plain = NostrTools.nip44.v2.decrypt(respEvt.content, convKey);
               const data = JSON.parse(plain);
               if (data && data.id === reqId) {
+                isPcOnline = true;
+                consecutiveFailures = 0;
+                lastSeenTime = Date.now();
                 setStatus('online', 'LAN DIRECT');
                 return data;
               }
@@ -770,14 +926,32 @@
       updatePinDots();
       pinView.style.display = 'none';
       landingStateView.style.display = 'none';
-      mainDashboard.style.display = 'flex';
-      startTelemetryLoop();
 
-      // Refresh telemetry using phone's cryptographic identity (zero PIN transmitted!)
-      sendRequest('telemetry').then((data) => {
-        const tel = (data && data.telemetry) ? data.telemetry : data;
-        if (tel && !data.error) updateTelemetryUI(tel);
-      }).catch(() => {});
+      const savedAction = loadActionState();
+      if (savedAction && savedAction.action && (Date.now() - (savedAction.timestamp || 0) < 30 * 60 * 1000)) {
+        showActionState(savedAction.action);
+      } else {
+        clearActionState();
+        mainDashboard.style.display = 'flex';
+        setStatus('connecting', 'CONNECTING...');
+        restoreCachedTelemetry();
+        startTelemetryLoop();
+
+        // Refresh telemetry using phone's cryptographic identity (zero PIN transmitted!)
+        sendRequest('telemetry').then((data) => {
+          const tel = (data && data.telemetry) ? data.telemetry : data;
+          if (tel && !data.error) {
+            consecutiveFailures = 0;
+            isPcOnline = true;
+            lastSeenTime = Date.now();
+            setStatus('online', config.lanHost ? 'LAN DIRECT' : 'CONNECTED');
+            updateTelemetryUI(tel);
+          }
+        }).catch(() => {
+          consecutiveFailures++;
+          setStatus('offline', 'OFFLINE');
+        });
+      }
 
     } catch (err) {
       // AES-GCM MAC verification failed -> Incorrect PIN
@@ -819,6 +993,10 @@
   // Update UI Telemetry
   function updateTelemetryUI(data) {
     if (!data) return;
+
+    lastTelemetryData = data;
+    saveLastTelemetry(data);
+    lastSeenTime = Date.now();
 
     if (data.deviceName) deviceName.textContent = data.deviceName;
 
@@ -865,12 +1043,12 @@
       btnLock.disabled = true;
       btnLock.classList.add('is-locked');
       lockName.textContent = 'Locked';
-      lockDesc.textContent = 'Workstation is currently locked';
+      lockDesc.textContent = 'PC is currently locked';
       lockRight.innerHTML = '<span class="locked-badge">Locked</span>';
     } else {
-      btnLock.disabled = false;
+      btnLock.disabled = !isPcOnline;
       btnLock.classList.remove('is-locked');
-      lockName.textContent = 'Lock Workstation';
+      lockName.textContent = 'Lock';
       lockDesc.textContent = 'Lock Windows immediately';
       lockRight.innerHTML = `
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -887,31 +1065,76 @@
         sendRequest('telemetry')
           .then((data) => {
             const tel = (data && data.telemetry) ? data.telemetry : data;
-            if (tel && !data.error) updateTelemetryUI(tel);
+            if (tel && !data.error) {
+              consecutiveFailures = 0;
+              isPcOnline = true;
+              lastSeenTime = Date.now();
+              setStatus('online', config.lanHost ? 'LAN DIRECT' : 'CONNECTED');
+              updateTelemetryUI(tel);
+            }
           })
-          .catch(() => {});
+          .catch(() => {
+            consecutiveFailures++;
+            if (consecutiveFailures >= 2) {
+              setStatus('offline', 'OFFLINE');
+              cpuValue.textContent = '--%';
+              cpuMeter.style.width = '0%';
+              ramValue.textContent = '--%';
+              ramMeter.style.width = '0%';
+              uptimeValue.textContent = '--';
+              networkName.textContent = 'Disconnected';
+              networkType.textContent = 'OFFLINE';
+            }
+          });
       }
     }, 4000);
   }
 
-  // Workstation Lock Action
+  // PC Lock Action
   btnLock.addEventListener('click', () => {
+    if (!isPcOnline) {
+      showToast('PC is offline');
+      return;
+    }
     btnLock.disabled = true;
     sendRequest('lock')
       .then((res) => {
-        showToast('Workstation locked');
+        showToast('PC locked');
         btnLock.classList.add('is-locked');
         lockName.textContent = 'Locked';
-        lockDesc.textContent = 'Workstation is currently locked';
+        lockDesc.textContent = 'PC is currently locked';
         lockRight.innerHTML = '<span class="locked-badge">Locked</span>';
       })
       .catch((e) => {
         showToast('Lock failed: ' + (e.message || 'Error'));
       })
       .finally(() => {
-        btnLock.disabled = false;
+        btnLock.disabled = !isPcOnline;
       });
   });
+
+  if (btnRefresh) {
+    btnRefresh.addEventListener('click', () => {
+      showToast('Checking PC status...');
+      sendRequest('telemetry')
+        .then((data) => {
+          const tel = (data && data.telemetry) ? data.telemetry : data;
+          if (tel && !data.error) {
+            consecutiveFailures = 0;
+            isPcOnline = true;
+            lastSeenTime = Date.now();
+            setStatus('online', config.lanHost ? 'LAN DIRECT' : 'CONNECTED');
+            updateTelemetryUI(tel);
+            showToast('PC is online');
+          }
+        })
+        .catch(() => {
+          consecutiveFailures++;
+          setStatus('offline', 'OFFLINE');
+          showToast('PC is offline');
+        });
+    });
+  }
 
   function openConfirm(action, title, desc, isDanger) {
     pendingAction = action;
@@ -923,15 +1146,23 @@
   }
 
   btnSleep.addEventListener('click', () => {
+    if (!isPcOnline) {
+      showToast('PC is offline');
+      return;
+    }
     openConfirm(
       'sleep',
       'Confirm Sleep',
-      'Windows will enter low-power sleep mode. You will need to press the laptop power button or wake it up locally to resume.',
+      'Windows will enter low-power sleep mode. You will need to press the PC power button or wake it up locally to resume.',
       false
     );
   });
 
   btnRestart.addEventListener('click', () => {
+    if (!isPcOnline) {
+      showToast('PC is offline');
+      return;
+    }
     openConfirm(
       'restart',
       'Confirm Restart',
@@ -941,10 +1172,14 @@
   });
 
   btnShutdown.addEventListener('click', () => {
+    if (!isPcOnline) {
+      showToast('PC is offline');
+      return;
+    }
     openConfirm(
       'shutdown',
       'Confirm Shut Down',
-      'Windows will shut down completely in 5 seconds. You will need physical access to turn the laptop on again.',
+      'Windows will shut down completely in 5 seconds. You will need physical access to turn the PC on again.',
       true
     );
   });
@@ -956,11 +1191,23 @@
 
   function showActionState(action) {
     if (pollInterval) clearInterval(pollInterval);
+    saveActionState({ action: action, timestamp: Date.now() });
 
     mainDashboard.style.display = 'none';
     pinView.style.display = 'none';
     landingStateView.style.display = 'none';
     actionStateView.style.display = 'flex';
+
+    if (btnStateDismiss) {
+      btnStateDismiss.style.display = 'inline-block';
+      btnStateDismiss.onclick = () => {
+        actionStateView.style.display = 'none';
+        mainDashboard.style.display = 'flex';
+        setStatus('offline', 'OFFLINE');
+        restoreCachedTelemetry();
+        startTelemetryLoop();
+      };
+    }
 
     if (action === 'sleep') {
       stateIconWrap.className = 'state-icon-wrap is-sleeping';
@@ -975,7 +1222,7 @@
     } else if (action === 'restart') {
       stateIconWrap.className = 'state-icon-wrap is-restarting';
       stateIconWrap.innerHTML = '<svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>';
-      stateTitle.textContent = 'Restarting Windows...';
+      stateTitle.textContent = 'Restarting PC...';
       stateDesc.textContent = 'Windows is rebooting. Connection will automatically restore once Windows starts back up.';
       stateBadgeDot.className = 'state-badge-dot pulse';
       stateBadgeText.textContent = 'REBOOTING';
@@ -1006,11 +1253,15 @@
         if (tel && !data.error) {
           clearInterval(reconnectTimer);
           reconnectTimer = null;
+          clearActionState();
+          isPcOnline = true;
+          consecutiveFailures = 0;
+          lastSeenTime = Date.now();
           actionStateView.style.display = 'none';
           mainDashboard.style.display = 'flex';
           updateTelemetryUI(tel);
           startTelemetryLoop();
-          showToast('Reconnected to Windows');
+          showToast('Reconnected to PC');
         }
       }).catch(() => {
         btnStateAction.textContent = `Auto-reconnecting (${attempts * 3}s)...`;
@@ -1024,11 +1275,15 @@
     sendRequest('telemetry').then((data) => {
       const tel = (data && data.telemetry) ? data.telemetry : data;
       if (tel && !data.error) {
+        clearActionState();
+        isPcOnline = true;
+        consecutiveFailures = 0;
+        lastSeenTime = Date.now();
         actionStateView.style.display = 'none';
         mainDashboard.style.display = 'flex';
         updateTelemetryUI(tel);
         startTelemetryLoop();
-        showToast('Reconnected');
+        showToast('Reconnected to PC');
       } else {
         showToast('PC is still offline');
       }
@@ -1036,7 +1291,7 @@
       showToast('PC is still offline');
     }).finally(() => {
       btnStateAction.disabled = false;
-      btnStateAction.textContent = 'Check connection again';
+      btnStateAction.textContent = 'Check if turned on';
     });
   }
 
@@ -1044,16 +1299,19 @@
     if (pendingAction) {
       const act = pendingAction;
       confirmModal.classList.remove('active');
+      saveActionState({ action: act, timestamp: Date.now() });
+      showActionState(act);
       sendRequest(act)
         .then((res) => {
           if (res && res.error) {
             showToast('Failed: ' + res.error);
+            clearActionState();
             return;
           }
-          showActionState(act);
         })
         .catch((e) => {
           showToast('Failed: ' + (e.message || 'Action failed'));
+          clearActionState();
         });
       pendingAction = null;
     }

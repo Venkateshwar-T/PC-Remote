@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/nbd-wtf/go-nostr"
 )
@@ -170,4 +172,132 @@ func TestConfig_PinVerification(t *testing.T) {
 	if errMsg == "" {
 		t.Fatal("Expected error message for incorrect PIN")
 	}
+}
+
+func TestConfig_UpdateDeviceLastSeen_DebounceAndFlush(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "pcremote_cfg_debounce_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	cfg, err := LoadOrCreate(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testPub := "test-pubkey-123"
+	_ = cfg.AuthorizeDevice(testPub, "Phone 1")
+
+	// Set long debounce interval
+	cfg.SetFlushInterval(10 * time.Second)
+
+	cfgFile := filepath.Join(tempDir, "config.json")
+	stat1, _ := os.Stat(cfgFile)
+	modTime1 := stat1.ModTime()
+
+	// Capture initial in-memory LastSeen
+	cfg.mu.RLock()
+	initialSeen := cfg.AuthorizedDevices[testPub].LastSeen
+	cfg.mu.RUnlock()
+
+	time.Sleep(15 * time.Millisecond)
+
+	// Perform 10 rapid in-memory updates
+	for i := 0; i < 10; i++ {
+		cfg.UpdateDeviceLastSeen(testPub)
+	}
+
+	// In-memory timestamp must be updated immediately
+	cfg.mu.RLock()
+	newSeen := cfg.AuthorizedDevices[testPub].LastSeen
+	cfg.mu.RUnlock()
+
+	if !newSeen.After(initialSeen) {
+		t.Fatal("UpdateDeviceLastSeen must update in-memory timestamp immediately")
+	}
+
+	// File must NOT have been written for every call (debounce suppression)
+	stat2, _ := os.Stat(cfgFile)
+	if !stat2.ModTime().Equal(modTime1) {
+		t.Fatal("Repeated UpdateDeviceLastSeen must not write to disk within debounce interval")
+	}
+
+	// Flush() must persist pending changes immediately
+	if err := cfg.Flush(); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+
+	stat3, _ := os.Stat(cfgFile)
+	if !stat3.ModTime().After(modTime1) {
+		t.Fatal("Flush must write dirty config to disk")
+	}
+
+	// Verify disk contents
+	cfgReloaded, err := LoadOrCreate(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfgReloaded.AuthorizedDevices[testPub].LastSeen.After(initialSeen) {
+		t.Fatal("Persisted LastSeen must reflect the updated timestamp")
+	}
+}
+
+func TestConfig_UpdateDeviceLastSeen_EventuallyPersisted(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "pcremote_cfg_eventual_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	cfg, _ := LoadOrCreate(tempDir)
+	testPub := "test-pubkey-eventual"
+	_ = cfg.AuthorizeDevice(testPub, "Phone Eventual")
+
+	// Set short debounce interval
+	cfg.SetFlushInterval(60 * time.Millisecond)
+
+	time.Sleep(10 * time.Millisecond)
+	cfg.UpdateDeviceLastSeen(testPub)
+
+	// Wait for background debounce timer to fire automatically
+	time.Sleep(150 * time.Millisecond)
+
+	cfgReloaded, err := LoadOrCreate(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloadedSeen := cfgReloaded.AuthorizedDevices[testPub].LastSeen
+	if reloadedSeen.IsZero() {
+		t.Fatal("Debounced changes must be automatically persisted after interval")
+	}
+}
+
+func TestConfig_UpdateDeviceLastSeen_ConcurrentRaceSafety(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "pcremote_cfg_race_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	cfg, _ := LoadOrCreate(tempDir)
+	testPub := "test-pubkey-concurrent"
+	_ = cfg.AuthorizeDevice(testPub, "Phone Concurrent")
+	cfg.SetFlushInterval(50 * time.Millisecond)
+
+	concurrency := 25
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				cfg.UpdateDeviceLastSeen(testPub)
+				_ = cfg.IsDeviceAuthorized(testPub)
+			}
+		}()
+	}
+
+	wg.Wait()
+	_ = cfg.Flush()
 }

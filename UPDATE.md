@@ -1,602 +1,1732 @@
-Now perform the next security-hardening pass on the CURRENT codebase.
+TASK: Convert PC Remote into a proper Windows boot-time background service + separate interactive tray/UI process.
 
-Do not redesign the UI or unrelated Windows functionality. Work from the current implementation that already uses:
 
-- real Nostr secp256k1 keypairs
-- Nostr signed events
-- NIP-44 E2EE
-- multiple public Nostr relays
-- authorized phone public keys
-- replay protection
-- public-entry state machine
-
-The goal now is to close the remaining security gaps without breaking the working architecture.
-
-==================================================
-1. PAIRING TOKEN: ACTUAL EXPIRATION + SINGLE USE
-==================================================
-
-Current code creates:
-
-pairingToken
-pairingExp = time.Now().Add(5 * time.Minute)
-
-but the token expiry is not actually enforced everywhere.
-
-Fix this properly.
-
-Requirements:
-
-- Pairing token must have cryptographically random entropy of at least 128 bits.
-- Pairing token must expire after 5 minutes.
-- Every validation must check both:
-  - token equality
-  - current time < pairing expiration
-- A successful pairing must consume the token immediately.
-- Once consumed, that token must never authorize another device.
-- Regenerate a fresh pairing token after successful pairing.
-- Prevent race conditions where two phones simultaneously submit the same valid token and both become authorized.
-- Token state must be protected by a mutex.
-- Do not expose whether a particular token currently exists to unauthenticated clients.
-
-Add tests for:
-
-A. valid token -> accepted
-B. expired token -> rejected
-C. wrong token -> rejected
-D. successful pairing -> token consumed
-E. reuse of consumed token -> rejected
-F. two concurrent pairing attempts with the same token -> only one may succeed
-
-==================================================
-2. REMOVE PLAINTEXT PIN FROM LAN CONTROL
-==================================================
-
-This is currently still wrong.
-
-The LAN path in web/app.js sends:
-
-pin
-token
-phonePubKey
-
-inside a plaintext HTTP request to:
-
-http://<LAN-IP>:8765/api/control
-
-Do NOT send the Master PIN as a normal LAN API field for authenticated commands.
-
-The security architecture must be:
-
-PHONE
-  |
-  | authenticated + encrypted command
-  |
-  +---- LAN ----> LAPTOP
-  |
-  +---- Nostr -> RELAY -> LAPTOP
-
-The transport may differ.
-The security protocol must not.
-
-Implement a common authenticated command/envelope format that can be transported through either:
-
-1. direct LAN HTTP
-2. Nostr relay
-
-For LAN:
-
-- browser creates the same cryptographically authenticated/encrypted payload used by the relay path
-- POST only the cryptographic envelope
-- laptop verifies signature
-- laptop decrypts
-- laptop checks sender authorization
-- laptop checks freshness/replay
-- laptop executes command
-
-Do not create a weaker "LAN security mode".
-
-The LAN server must reject old-style plaintext PIN command requests after migration, except where an explicitly required first-time pairing path genuinely needs the PIN.
-
-==================================================
-3. MASTER PIN MODEL
-==================================================
-
-Keep the 6-digit Master PIN.
-
-But use it correctly.
-
-Desired model:
-
-PAIRING:
-- user enters Master PIN
-- laptop verifies it
-- laptop authorizes the phone's public key
-- PIN must never become the long-term remote authentication credential
-
-AFTER PAIRING:
-- remote commands authenticate using the phone's cryptographic identity
-- PIN is not transmitted with commands
-- PIN is not required by the laptop for every remote command
-
-PHONE UI:
-- the Master PIN should still protect access to the phone dashboard/session if the current UX is intended to require PIN on app unlock
 
 IMPORTANT:
-The current already-paired flow appears to set:
 
-config.pin = entered PIN
+This is an architectural change, but preserve the existing product behavior, cryptographic protocol, PWA, relay architecture, LAN architecture, security model, and UI wherever possible.
 
-and then simply sends a cryptographic telemetry request.
 
-That means the laptop may never actually verify that entered PIN.
 
-Fix this.
+Do NOT simply make the current GUI process an interactive Windows service.
 
-When the phone is already paired and the user is asked for the Master PIN:
 
-- verify the PIN locally using a secure verifier derived from information established during pairing
-- do NOT send the PIN to the laptop just to unlock the UI
-- do NOT falsely treat any 6 digits as correct
-- do NOT store the plaintext PIN
 
-Use a proper challenge/verifier design appropriate for a 6-digit local unlock secret.
+Windows services cannot directly interact with the interactive desktop. The service and tray/UI must be separate responsibilities.
 
-Do not weaken cryptographic remote authentication just to implement the UI lock.
 
-Clearly separate:
-
-LOCAL PHONE UNLOCK
-vs.
-REMOTE DEVICE AUTHORIZATION
 
 ==================================================
-4. PROTECT phonePrivkey
-==================================================
 
-The current phone private key is stored directly in localStorage.
-
-Do not leave the long-term private key as plaintext localStorage data if a better browser-native architecture is practical.
-
-Preferred design:
-
-- store the private signing key in IndexedDB rather than localStorage
-- use Web Crypto where appropriate
-- prefer a non-exportable CryptoKey where compatible with the cryptographic implementation
-- if the Nostr library requires raw key bytes and non-exportable CryptoKey cannot be used without breaking the required secp256k1/Nostr protocol, do NOT invent an incompatible crypto layer
-
-If raw private-key material must remain browser-accessible because of library limitations:
-
-- minimize how long it lives in JS memory
-- never log it
-- never place it in URLs
-- never place it in relay metadata
-- never place it in errors/toasts
-- never transmit it directly
-- explain the remaining browser-storage limitation accurately
-
-Do not claim that localStorage/IndexedDB is a secure vault.
-
-Treat all client-side storage as attacker-modifiable.
+1\. PRIMARY REQUIREMENT
 
 ==================================================
-5. REMOVE NIP-04 FALLBACK
+
+
+
+CURRENT BEHAVIOR:
+
+
+
+PC Remote currently starts through the user's Windows Startup folder.
+
+
+
+Therefore after reboot:
+
+
+
+Windows boot
+
+→ Windows login screen
+
+→ user enters Windows PIN/password/fingerprint
+
+→ PC Remote starts
+
+→ remote control becomes available
+
+
+
+DESIRED BEHAVIOR:
+
+
+
+PC reboot
+
+→ Windows boots
+
+→ PC Remote BACKGROUND SERVICE starts automatically
+
+→ Nostr relay connections establish
+
+→ LAN HTTP server starts
+
+→ remote commands can already reach the PC
+
+→ Windows may still be sitting at the login screen
+
+→ remote Lock/Sleep/Restart/Shutdown/Telemetry functionality remains available
+
+
+
+After the user logs into Windows:
+
+
+
+→ PC Remote TRAY/UI starts
+
+→ pairing QR window/settings/interactive features become available
+
+
+
+Also preserve:
+
+
+
+Logged-in Windows + Win+L locked
+
+→ service remains running
+
+→ remote control remains available
+
+
+
+This is the required final behavior.
+
+
+
 ==================================================
 
-Current relay client attempts:
-
-NIP-44
-then NIP-04 fallback
-
-Remove the weaker fallback unless there is a concrete interoperability requirement that cannot otherwise be solved.
-
-PC Remote should use one clearly defined modern encryption protocol.
-
-Use NIP-44 consistently.
-
-Do not silently downgrade security.
-
-Update tests accordingly.
+2\. DO NOT TURN THE CURRENT GUI INTO A SERVICE
 
 ==================================================
-6. REPLAY PROTECTION HARDENING
+
+
+
+Do NOT run the existing tray/UI/message-loop code directly as a Windows service.
+
+
+
+Windows services run outside the interactive desktop/session.
+
+
+
+Create a clean separation:
+
+
+
+A. PC Remote Service
+
+B. PC Remote Tray/UI
+
+
+
+The service owns all functionality necessary for remote operation.
+
+
+
+The tray owns only interactive desktop functionality.
+
+
+
 ==================================================
 
-Current ReplayGuard checks:
+3\. SERVICE RESPONSIBILITIES
 
-- request ID
-- timestamp freshness
-- duplicate IDs
+==================================================
 
-Improve it.
+
+
+The Windows service MUST own:
+
+
+
+\- Nostr relay connections
+
+\- NIP-44 cryptographic processing
+
+\- laptop cryptographic identity
+
+\- protected laptop private key
+
+\- pairing-token state
+
+\- Master PIN verifier
+
+\- authorized phone public-key allowlist
+
+\- replay protection
+
+\- command protocol handler
+
+\- LAN /api/control server
+
+\- telemetry generation
+
+\- Lock
+
+\- Sleep
+
+\- Restart
+
+\- Shutdown
+
+\- service lifecycle
+
+\- persistence of security-sensitive state
+
+\- rate limiting/concurrency protection
+
+
+
+The service must remain fully functional when:
+
+
+
+\- no user is logged in
+
+\- Windows is sitting at the login screen
+
+\- the interactive user session does not yet exist
+
+
+
+Do NOT make the remote-control path depend on the tray process.
+
+
+
+==================================================
+
+4\. TRAY/UI RESPONSIBILITIES
+
+==================================================
+
+
+
+The tray/UI process should own:
+
+
+
+\- system tray icon
+
+\- pairing QR display
+
+\- pairing window
+
+\- desktop PIN setup/change UI
+
+\- opening the PWA
+
+\- desktop notifications
+
+\- interactive settings/UI
+
+
+
+The tray must communicate with the service through LOCAL IPC only.
+
+
+
+Do NOT communicate between tray and service over HTTP.
+
+Do NOT expose an additional TCP control port for tray↔service communication.
+
+
+
+Preferred IPC:
+
+\- Windows Named Pipe
+
+
+
+Example conceptual pipe:
+
+
+
+\\\\.\\pipe\\PCRemote
+
+
+
+Use a dedicated, strongly restricted security descriptor / DACL.
+
+
+
+The pipe must NOT be remotely accessible over SMB/network.
+
+
+
+Microsoft documents that named pipes are securable through ACLs and that local-only use should explicitly prevent remote access. Use an appropriate ACL and deny network access. Do not leave the default permissive pipe security descriptor. 
+
+
+
+The service must validate the caller's Windows identity/SID where appropriate.
+
+
+
+==================================================
+
+5\. IPC SECURITY MODEL
+
+==================================================
+
+
+
+Do not make the tray an alternative authority.
+
+
+
+The service remains the sole authority.
+
+
+
+The tray should only request operations such as:
+
+
+
+\- GetPairingInfo
+
+\- Show/refresh pairing information
+
+\- Get device status
+
+\- Request PIN setup state
+
+\- Set/change PIN
+
+\- Request service status
+
+\- Request controlled shutdown of service if explicitly supported
+
+
+
+Never allow the pipe to bypass the normal security model.
+
+
+
+Do NOT create IPC methods such as:
+
+
+
+"execute arbitrary command"
+
+
+
+"run arbitrary PowerShell"
+
+
+
+"run arbitrary exe"
+
+
+
+"execute lock without validation"
+
+
+
+The IPC interface must have a strict allowlist of operations.
+
+
+
+Authenticate the local IPC caller using Windows security context/SID.
+
+
+
+Prefer restricting the pipe to the Windows account that owns the PC Remote installation/configuration.
+
+
+
+Do not give arbitrary local network users access.
+
+
+
+==================================================
+
+6\. CRYPTOGRAPHIC KEY STORAGE — CRITICAL
+
+==================================================
+
+
+
+CURRENT CODE:
+
+
+
+The laptop private key uses normal Windows DPAPI user-scoped protection.
+
+
+
+That currently works because the existing application runs in the logged-in user's context.
+
+
+
+Do NOT simply move the current DPAPI blob into a LocalSystem service.
+
+
+
+The service account context is different.
+
+
+
+Design proper service-owned secret storage.
+
+
+
+Preferred architecture:
+
+
+
+\- Run the background service under the least-privileged suitable built-in Windows service account, preferably LocalService unless a stronger reason requires another account.
+
+\- Do NOT use LocalSystem unless absolutely necessary.
+
+\- Do NOT require storing the user's Windows password.
+
+\- Do NOT ask the user for their Windows password just to install the service.
+
+\- Do NOT use CRYPTPROTECT\_LOCAL\_MACHINE merely as a shortcut without considering its security consequences.
+
+
+
+Use service-account-scoped DPAPI for the service-owned secret where appropriate.
+
+
+
+The service should generate/store/decrypt its long-term laptop private key in its own security context.
+
+
+
+The encrypted key file must be protected with filesystem ACLs so ordinary users cannot replace/read/modify it.
+
+
+
+The service must own the authoritative copy of the laptop private key.
+
+
+
+==================================================
+
+7\. EXISTING INSTALLATION / MIGRATION
+
+==================================================
+
+
+
+Preserve existing users where reasonably possible.
+
+
+
+CURRENT INSTALLATIONS may have:
+
+
+
+config.json
+
+containing an existing user-scoped DPAPI-protected laptop private key.
+
+
+
+Implement a safe migration path.
+
+
+
+Preferred migration flow:
+
+
+
+1\. During upgrade/first service installation, the existing user-session process can decrypt the old user-scoped DPAPI private key.
+
+2\. Pass the plaintext key ONLY through a secure local IPC mechanism to the newly installed service.
+
+3\. Service validates the keypair.
+
+4\. Service re-encrypts/protects it using its own service-context protection.
+
+5\. Service persists the protected key in its service-owned configuration.
+
+6\. Plaintext key must never be written to disk.
+
+7\. Never put the private key in command-line arguments.
+
+8\. Never put the private key in environment variables.
+
+9\. Never put the private key in logs.
+
+10\. Never transmit the private key over the network.
+
+
+
+After successful migration, securely remove the obsolete plaintext/old-format storage.
+
+
+
+If seamless migration is impossible in a safe manner, fail clearly and preserve the old configuration rather than silently destroying identity.
+
+
+
+DO NOT silently generate a new laptop identity merely because the service cannot access the old one.
+
+
+
+==================================================
+
+8\. SERVICE CONFIGURATION LOCATION
+
+==================================================
+
+
+
+Do not keep security-sensitive service state next to a per-user GUI executable if that creates weak filesystem permissions.
+
+
+
+Choose a proper machine/application-data location, such as ProgramData, with explicit ACLs.
+
+
+
+Service configuration should be inaccessible for modification by unprivileged users.
+
+
+
+At minimum, protect:
+
+
+
+\- laptop private key ciphertext
+
+\- PIN verifier
+
+\- PIN salt
+
+\- authorized device list
+
+\- pairing state
+
+
+
+The service must be the authoritative configuration owner.
+
+
+
+Do not let the tray directly edit config files.
+
+
+
+==================================================
+
+9\. PAIRING SYSTEM
+
+==================================================
+
+
+
+Preserve the existing:
+
+
+
+\- 128-bit cryptographically secure pairing token
+
+\- 5-minute expiration
+
+\- atomic single-use consumption
+
+\- race protection
+
+
+
+The service owns this state.
+
+
+
+The tray requests the current pairing URL/token from the service through secure IPC.
+
+
+
+CRITICAL:
+
+
+
+The pairing QR must always represent the current pairing token.
+
+
+
+Do not cache the pairing URL forever.
+
+
+
+After token rotation:
+
+
+
+\- service produces fresh pairing data
+
+\- tray refreshes the QR
+
+\- "Show Pairing QR Code" always displays current information
+
+
+
+The service must be able to rotate pairing state even though the tray is not running.
+
+
+
+==================================================
+
+10\. SERVICE STARTUP
+
+==================================================
+
+
+
+Install the PC Remote daemon as a real Windows service.
+
+
 
 Requirements:
 
-- replay identity should be scoped to sender identity, not only a bare request ID
-- reject duplicate (sender, requestID)
-- reject stale timestamps
-- reject excessive future timestamps
-- use the Nostr event CreatedAt as well as the inner command timestamp
-- do not accept a command if the two timestamps differ beyond a small reasonable tolerance
-- keep bounded memory
-- prune expired entries deterministically
-- do not allow an attacker to grow replay-cache memory without bound
 
-Add tests for:
 
-A. normal command
-B. exact replay
-C. same request ID from different sender
-D. stale event
-E. future event
-F. mismatched inner timestamp vs event timestamp
-G. large number of replay entries
-H. concurrent replay checks
+\- Service type: own process
 
-==================================================
-7. AUTHORIZATION MUST BE SERVER-SIDE
-==================================================
+\- Start type: SERVICE\_AUTO\_START
 
-Never trust these browser fields:
+\- Run without interactive user login
 
-- isPaired
-- laptopPubkey
-- phonePubkey
-- deviceName
-- pairingToken
+\- Report proper service states to SCM
 
-The browser may modify all of them.
+\- Properly handle START\_PENDING
 
-The laptop is the source of truth.
+\- Transition to RUNNING only after essential initialization
 
-For every remote command:
+\- Respond to STOP
 
-1. verify Nostr event signature
-2. extract authenticated sender public key
-3. decrypt payload
-4. verify sender public key is authorized
-5. verify freshness
-6. verify replay state
-7. validate action against a strict allowlist
-8. execute
+\- Respond to SHUTDOWN
 
-Do not use isPaired as an authorization condition on the laptop.
+\- Stop network listeners cleanly
 
-It is UI state only.
+\- Close Nostr connections cleanly
+
+\- Persist required state before shutdown when necessary
+
+
+
+Do not perform long/unbounded work before registering with SCM.
+
+
+
+Follow proper ServiceMain/service-control-handler behavior.
+
+
+
+If initialization takes time, report progress/status appropriately.
+
+
 
 ==================================================
-8. STRICT MESSAGE VALIDATION
-==================================================
 
-Before executing anything:
-
-- maximum event size
-- maximum ciphertext size
-- maximum plaintext size
-- maximum device name length
-- strict request ID format/length
-- strict action enum
-- valid timestamps
-- no unknown dangerous fields if practical
-
-Do not allow arbitrary command execution.
-
-Allowed actions remain only:
-
-- telemetry
-- lock
-- sleep
-- restart
-- shutdown
-
-Keep change_pin desktop-only.
+11\. SERVICE RECOVERY
 
 ==================================================
-9. RESPONSE SECURITY
-==================================================
 
-Replies must:
 
-- be signed by the laptop
-- be encrypted to the phone
-- contain the request ID
-- contain fresh timestamp
-- never contain the Master PIN
-- never contain private keys
-- never leak unnecessary internal errors
 
-Phone must reject responses when:
+Configure SCM service recovery so unexpected service crashes do not permanently disable remote control.
 
-- signature invalid
-- sender is not the expected laptop public key
-- response ID is not pending
-- response is stale
-- response has already been processed
 
-==================================================
-10. NOSTR EVENT HANDLING
-==================================================
 
-Keep real Nostr protocol usage.
+Preferred recovery:
 
-Do NOT return to raw custom JSON over a WebSocket.
 
-Review subscription filters and ensure:
 
-- laptop only processes events addressed to its public key
-- phone only accepts responses from the paired laptop
-- signatures are verified before trust
-- only the intended event kind/protocol is processed
-- malformed relay data is ignored safely
+First failure:
 
-If the chosen Nostr event kind has a known modern replacement, evaluate it, but do not make a gratuitous protocol migration unless it materially improves PC Remote's security/privacy and remains reliable in browser + Go clients.
+restart service
 
-==================================================
-11. PUBLIC ENTRY STATE MACHINE
-==================================================
 
-Preserve the recently implemented public-entry behavior.
 
-Direct visit:
+Second failure:
 
-https://pc-remote-45t.pages.dev/
+restart service
 
-must remain:
 
-No Device Paired
 
-with:
+Subsequent failure:
 
-- zero relay connections
-- zero LAN requests
-- zero telemetry requests
-- zero API requests
+restart service
 
-Malformed pairing URL:
-→ Invalid Pairing Link
 
-Expired pairing:
-→ Pairing Link Expired
 
-Previously authenticated local state:
-→ local PIN unlock screen
+Use reasonable reset periods.
 
-Authenticated device but PC unavailable:
-→ Device unavailable/reconnecting
 
-Do not let browser-stored isPaired=true bypass actual cryptographic authorization.
+
+Do not configure catastrophic behavior such as system reboot when PC Remote crashes.
+
+
+
+Do not create a restart loop that consumes CPU aggressively.
+
+
 
 ==================================================
-12. PWA STORAGE / SERVICE WORKER
-==================================================
 
-Review sw.js and app startup carefully.
-
-Requirements:
-
-- cached app shell must never imply authentication
-- clearing storage must return to unauthenticated state
-- stale cached JS must not accidentally reintroduce old insecure protocol behavior if possible
-- version cache names correctly
-- ensure deployed app updates propagate reliably
-- never cache sensitive API responses or authenticated device data as static cache entries
-
-Do not put secrets into the service-worker cache.
+12\. TRAY STARTUP
 
 ==================================================
-13. LOCAL SERVER SECURITY
+
+
+
+After introducing a boot-time service:
+
+
+
+Do not use the tray application as the mechanism that makes remote control available.
+
+
+
+The service starts at boot.
+
+
+
+The tray starts after user login.
+
+
+
+The tray may be registered using the per-user startup mechanism, or an equivalent user-session startup mechanism.
+
+
+
+When tray starts:
+
+
+
+\- connect to the local service
+
+\- query service state
+
+\- query current pairing information
+
+\- display the pairing UI if required
+
+\- do not duplicate the network daemon
+
+
+
+Do not start a second Nostr client from the tray.
+
+
+
+Do not start a second LAN server from the tray.
+
+
+
+Do not create duplicate cryptographic state.
+
+
+
 ==================================================
 
-Review local_server.go again.
+13\. MAIN PROCESS ARCHITECTURE
+
+==================================================
+
+
+
+Refactor the current main entry point cleanly.
+
+
+
+Use explicit modes if a single executable is preferable, for example conceptually:
+
+
+
+PC-Remote.exe service
+
+PC-Remote.exe tray
+
+
+
+or separate service/tray executables if that is cleaner.
+
+
+
+Do NOT rely on fragile detection of "running as service" based purely on environment guesses.
+
+
+
+The service entry point must properly integrate with Windows SCM.
+
+
+
+The tray entry point must only initialize interactive UI.
+
+
+
+Keep shared protocol/config/security packages reusable between the two.
+
+
+
+Avoid duplicated security logic.
+
+
+
+==================================================
+
+14\. LAN SERVER
+
+==================================================
+
+
+
+The LAN HTTP server must run inside the SERVICE.
+
+
+
+It must therefore be alive before the user logs into Windows.
+
+
+
+Preserve:
+
+
+
+\- signed Nostr event envelope
+
+\- NIP-44 encryption
+
+\- server-side phone public-key authorization
+
+\- replay protection
+
+\- request size limits
+
+\- strict action allowlist
+
+\- LAN concurrency limit
+
+\- rate limiting
+
+\- current CORS restrictions
+
+
+
+Do not create a separate insecure service endpoint for LAN control.
+
+
+
+==================================================
+
+15\. NOSTR RELAY
+
+==================================================
+
+
+
+The Nostr relay client must run in the SERVICE.
+
+
+
+It must work before user login.
+
+
+
+Preserve:
+
+
+
+\- current three-relay architecture
+
+\- NIP-44 v2 only
+
+\- BIP-340 signatures
+
+\- event verification
+
+\- destination tag validation
+
+\- replay protection
+
+\- bounded relay worker concurrency
+
+\- response encryption/signing
+
+
+
+Do not move relay networking into the tray.
+
+
+
+==================================================
+
+16\. WINDOWS ACTIONS
+
+==================================================
+
+
+
+Verify each Windows operation from service context:
+
+
+
+\- telemetry
+
+\- Lock Workstation
+
+\- Sleep
+
+\- Restart
+
+\- Shutdown
+
+
+
+Important:
+
+
+
+Do not assume interactive desktop APIs behave the same from Session 0.
+
+
+
+Test Lock Workstation specifically while no interactive user is logged in and while an interactive session is locked.
+
+
+
+Use the correct Windows APIs for service context.
+
+
+
+Do not allow the service to create an interactive service desktop/window.
+
+
+
+Windows explicitly separates services from interactive sessions.
+
+
+
+==================================================
+
+17\. MASTER PIN
+
+==================================================
+
+
+
+The Master PIN remains:
+
+
+
+\- 6 numeric digits
+
+\- set/changed through the desktop UI
+
+\- verified by the SERVICE for initial pairing
+
+\- never transmitted as plaintext remote command authentication
+
+\- not required for each remote command
+
+
+
+After pairing:
+
+
+
+phone cryptographic identity authorizes remote commands.
+
+
+
+Do not move Master PIN handling back into the tray as an authority.
+
+
+
+The tray may ask the service to set/change the PIN through authenticated local IPC.
+
+
+
+==================================================
+
+18\. INSTALLER REDESIGN
+
+==================================================
+
+
+
+The current installer is per-user oriented.
+
+
+
+Change it appropriately for a real boot-time service.
+
+
+
+A system service requires administrative installation.
+
+
+
+The installer should:
+
+
+
+1\. install service binary to a protected machine-wide location
+
+2\. install any required tray binary/components
+
+3\. create necessary ProgramData/config directories
+
+4\. set secure filesystem ACLs
+
+5\. register PC Remote service with SCM
+
+6\. configure SERVICE\_AUTO\_START
+
+7\. configure service recovery
+
+8\. start service after installation
+
+9\. install tray startup entry for the logged-in installing user
+
+10\. optionally start tray immediately after installation
+
+
+
+Do not put service configuration in the user's Startup folder.
+
+
+
+Do not use task scheduler as a substitute for the service unless there is a compelling Windows compatibility reason.
+
+
+
+The installer should clearly explain that PC Remote's background service starts with Windows so remote control remains available before login.
+
+
+
+Suggested wording:
+
+
+
+"Run PC Remote in the background automatically with Windows"
+
+
+
+Description:
+
+
+
+"Allows your PC to remain remotely reachable after reboot, even before you sign in to Windows."
+
+
+
+==================================================
+
+19\. UNINSTALL / UPGRADE
+
+==================================================
+
+
+
+Handle service lifecycle safely.
+
+
+
+Before uninstall:
+
+
+
+\- stop service
+
+\- wait for confirmed STOPPED state
+
+\- unregister/delete service
+
+\- stop tray process
+
+\- remove tray startup entry
+
+\- remove application binaries
+
+
+
+Do not use unsafe blanket taskkill by process name if that could terminate an unrelated process with the same filename.
+
+
+
+Prefer SCM-controlled service stop and precise process management.
+
+
+
+For configuration/data:
+
+
+
+Decide explicitly whether user configuration is removed.
+
+
+
+Do not silently erase security identity on every upgrade.
+
+
+
+For uninstall, provide deliberate data behavior.
+
+
+
+Do not automatically delete user data merely because the binary is being upgraded.
+
+
+
+==================================================
+
+20\. FIREWALL / NETWORKING
+
+==================================================
+
+
+
+Verify the service can:
+
+
+
+\- establish outbound WSS relay connections before user login
+
+\- bind the LAN HTTP port before user login
+
+
+
+Check whether Windows Firewall requires an explicit rule for LAN direct mode.
+
+
+
+If a firewall rule is needed, create the narrowest appropriate rule:
+
+
+
+\- only the required executable/service
+
+\- only required port
+
+\- preferably local/private network scope
+
+\- no unnecessary public exposure
+
+
+
+Do not create broad "allow all inbound TCP" rules.
+
+
+
+==================================================
+
+21\. SERVICE ACCOUNT / PRIVILEGE MINIMIZATION
+
+==================================================
+
+
+
+Use least privilege.
+
+
+
+Prefer LocalService where technically sufficient.
+
+
+
+Do not run as LocalSystem simply because it is easier.
+
+
+
+The service should not require:
+
+
+
+\- arbitrary process creation
+
+\- shell execution
+
+\- PowerShell execution
+
+\- administrative token for ordinary telemetry
+
+\- arbitrary filesystem access
+
+
+
+Grant only permissions actually required for:
+
+
+
+\- network access
+
+\- Windows power operations
+
+\- required telemetry APIs
+
+\- service-owned configuration
+
+\- IPC
+
+
+
+Document any privilege that cannot be avoided.
+
+
+
+==================================================
+
+22\. SECURITY OF THE TRAY ↔ SERVICE PIPE
+
+==================================================
+
+
+
+The named pipe is security-sensitive.
+
+
+
+Do NOT expose:
+
+
+
+\\\\.\\pipe\\PCRemote
+
+
+
+with default broad permissions.
+
+
+
+Create an explicit security descriptor.
+
+
+
+Prevent remote/network access.
+
+
+
+Restrict access to the intended local Windows user/account(s).
+
+
+
+Validate the client's Windows identity where sensitive operations are involved.
+
+
+
+Reject malformed requests.
+
+
+
+Bound message sizes.
+
+
+
+Use request/response correlation IDs if needed.
+
+
+
+Do not let a malicious local process invoke privileged service operations simply because it can connect to the pipe.
+
+
+
+==================================================
+
+23\. DO NOT BREAK CURRENT CRYPTO ARCHITECTURE
+
+==================================================
+
+
 
 Keep:
 
-- request body limits
-- restrictive CORS
-- HTTP timeouts
-- path traversal protection
 
-Improve where necessary:
 
-- reject malformed methods
-- avoid unnecessary information disclosure from /api/status
-- do not expose network/device telemetry to unauthenticated callers
-- do not accept legacy plaintext command authentication
-- ensure Origin/CORS rules are correct
-- validate Local Network Access handling without broadening access unnecessarily
+\- NIP-44 v2
 
-==================================================
-14. CONFIG FILE SECURITY
-==================================================
+\- BIP-340 Schnorr
 
-The laptop private key is currently stored in config.json.
+\- Nostr Event Kind 4
 
-Review this seriously.
+\- recipient p-tag
 
-Prefer using Windows DPAPI / Windows Credential Manager for the laptop private key if practical.
+\- phone public-key authorization
 
-The long-term laptop private key should not be treated as ordinary JSON configuration if it can be protected by the operating system.
+\- single-use pairing token
 
-Requirements:
+\- replay protection
 
-- preserve key across normal restarts
-- preserve pairing across normal restarts
-- prevent another ordinary user/process from trivially reading the plaintext private key from config.json
-- migrate existing installations safely
-- never silently destroy an existing valid keypair
-- provide a safe fallback if DPAPI/Credential Manager is unavailable
+\- signed/encrypted response events
 
-Do not expose private-key material in logs or CLI output.
+\- phone IndexedDB/Web Crypto vault
 
-In particular, reconsider printing the full Nostr public/private identity-related configuration in places where it isn't necessary.
+\- public PWA state machine
 
-Public key may be displayed.
-Private key must never be printed.
+\- LAN/relay protocol parity
 
-==================================================
-15. RATE LIMITING
-==================================================
 
-Keep PIN brute-force protection.
 
-Also consider:
+Do not reintroduce:
 
-- pairing attempt rate limiting
-- invalid-event rate limiting
-- per-sender throttling
-- malformed-event throttling
 
-Do not let a malicious relay feed the PC a huge stream of expensive decrypt/verify operations.
 
-Bound concurrency and expensive cryptographic work.
+\- plaintext PIN over LAN
+
+\- PIN on every remote request
+
+\- NIP-04
+
+\- unauthenticated remote commands
+
+\- browser localStorage private-key storage
+
+\- arbitrary local control endpoint
+
+
 
 ==================================================
-16. PERFORMANCE
-==================================================
 
-Do not optimize by forcing artificially low RAM usage.
-
-Review the existing:
-
-debug.SetGCPercent(20)
-debug.FreeOSMemory()
-SetProcessWorkingSetSize(...)
-
-behavior.
-
-Prefer normal Go runtime behavior unless profiling demonstrates a real problem.
-
-The daemon should optimize for:
-
-- low idle CPU
-- stable memory
-- low network usage
-- low latency
-- no goroutine leaks
-- no busy reconnect loops
-- bounded cryptographic work
-
-Do not chase an arbitrary "10 MB" Task Manager number.
+24\. PUBLIC PWA
 
 ==================================================
-17. TESTING
+
+
+
+The public Cloudflare Pages PWA remains a client.
+
+
+
+A random visitor:
+
+
+
+https://pc-remote-45t.pages.dev/
+
+
+
+must still receive:
+
+
+
+"No Device Paired"
+
+
+
+and:
+
+
+
+\- zero relay connections
+
+\- zero LAN requests
+
+\- no dashboard
+
+\- no PIN-unlock flow unless valid pairing/session context exists
+
+
+
+Do not make the service architecture change alter this state machine.
+
+
+
 ==================================================
 
-Actually run:
+25\. PERFORMANCE / STABILITY
 
-go test -v ./...
+==================================================
+
+
+
+The service must remain lightweight.
+
+
+
+Avoid:
+
+
+
+\- unbounded goroutines
+
+\- unbounded queues
+
+\- busy polling
+
+\- repeated config writes
+
+\- duplicate relay connections
+
+\- duplicate LAN servers
+
+\- duplicate tray processes
+
+
+
+Preserve the current relay concurrency bounds.
+
+
+
+Preserve the current LAN concurrency bounds.
+
+
+
+Use graceful shutdown.
+
+
+
+Do not reintroduce artificial GC/working-set hacks just to make memory numbers look smaller.
+
+
+
+==================================================
+
+26\. TESTING REQUIREMENTS
+
+==================================================
+
+
+
+Add real tests for the service architecture.
+
+
+
+At minimum:
+
+
+
+A. Service starts successfully without a logged-in user where testable
+
+B. Service initializes relay client
+
+C. Service initializes LAN server
+
+D. Service reads protected configuration
+
+E. Service can decrypt its own protected laptop private key
+
+F. Service rejects unauthorized commands
+
+G. Service accepts authorized commands
+
+H. Replay protection remains functional
+
+I. Pairing token remains single-use
+
+J. QR information comes from current token
+
+K. Tray communicates through secured local IPC
+
+L. Unauthorized local IPC client is rejected
+
+M. Malformed IPC requests are rejected
+
+N. Service stop is graceful
+
+O. Service restart recovers normally
+
+P. Upgrade/migration preserves laptop identity where possible
+
+Q. No private key appears in logs
+
+R. No private key appears in command-line arguments
+
+S. No plaintext PIN appears in network command payloads
+
+
+
+Run:
+
+
+
+go test -count=1 ./...
+
+go test -race ./...
+
 go vet ./...
 
-Also run the JavaScript state tests.
+node tests/state\_test.js
 
-Add tests for every security requirement above.
 
-In particular verify:
 
-A. PIN never appears in relay event plaintext
-B. PIN never appears in non-pairing remote commands
-C. LAN uses the same E2EE/authentication model
-D. expired pairing token rejected
-E. pairing token is single-use
-F. duplicate command rejected
-G. stale command rejected
-H. unauthorized phone rejected
-I. modified event rejected
-J. modified ciphertext rejected
-K. random public visitor creates no connections
-L. fake URL values do not create a trusted device
-M. deleting/modifying local storage does not authorize a device
-N. wrong local PIN does not unlock an already-paired session
-O. private keys are not logged
-P. service-worker cache cannot bypass authentication
-Q. multiple relays can fail without breaking the daemon
-R. no unbounded goroutine/memory growth from relay traffic
+If Windows-specific service tests require Windows, execute those on Windows and report the actual result.
+
+
 
 ==================================================
-18. DOCUMENTATION ACCURACY
+
+27\. MANUAL ACCEPTANCE TEST
+
 ==================================================
 
-Update README security claims to match the implementation exactly.
+
+
+After implementation, explicitly verify this sequence on a real Windows installation:
+
+
+
+TEST 1:
+
+Install PC Remote.
+
+
+
+TEST 2:
+
+Restart Windows.
+
+
+
+TEST 3:
+
+Stop at the Windows PIN/password/fingerprint login screen.
+
+
+
+DO NOT LOG IN.
+
+
+
+From an already-paired phone using mobile data:
+
+send telemetry.
+
+
+
+Expected:
+
+PC Remote responds.
+
+
+
+Then:
+
+send Lock.
+
+
+
+Expected:
+
+command is accepted as appropriate for the current Windows session state.
+
+
+
+Then:
+
+log into Windows.
+
+
+
+Expected:
+
+PC Remote tray appears.
+
+
+
+Then:
+
+press Win+L.
+
+
+
+Expected:
+
+PC Remote service remains alive and remote telemetry/control still works.
+
+
+
+Then:
+
+log back in.
+
+
+
+Expected:
+
+tray communicates with the already-running service.
+
+
+
+==================================================
+
+28\. IMPORTANT FAILURE RULE
+
+==================================================
+
+
 
 Do not claim:
 
-- "unhackable"
-- "perfect security"
-- "anonymous"
-- "zero metadata"
-- "relay sees nothing"
 
-unless technically true.
 
-Accurately document:
+"service works before login"
 
-- E2EE
-- signed commands
-- authorized phone keys
-- PIN role
-- replay protection
-- relay-visible metadata
-- LAN vs internet transport
-- browser storage limitations
-- pairing expiration
-- revocation behavior
+
+
+unless this has actually been tested on Windows.
+
+
+
+Do not claim:
+
+
+
+"existing installations migrate safely"
+
+
+
+unless the migration path has actually been tested.
+
+
+
+Do not claim:
+
+
+
+"private key is protected"
+
+
+
+unless the service-context storage and filesystem ACLs have actually been inspected/tested.
+
+
 
 ==================================================
-19. IMPORTANT IMPLEMENTATION RULE
+
+29\. IMPLEMENTATION STYLE
+
 ==================================================
 
-Do not make superficial changes just to satisfy tests.
 
-I want the security model to be coherent:
 
-              PHONE
-                |
-        local PIN unlock
-                |
-        phone private key
-                |
-        sign + encrypt
-                |
-        +-------+-------+
-        |               |
-       LAN            Nostr
-        |               |
-        +-------+-------+
-                |
-              LAPTOP
-                |
-         verify signature
-                |
-         decrypt payload
-                |
-        authorized key check
-                |
-          replay/freshness
-                |
-        strict action allowlist
-                |
-           Win32 action
+This is a production architecture change.
 
-The PIN protects the user's ability to use the phone client.
-The cryptographic phone identity authorizes the phone to control the PC.
-The laptop remains the ultimate security authority.
 
-Do not create a second weaker authentication protocol for LAN.
 
-At the end, report:
+Do not produce a giant pile of duplicated code.
 
-1. exact files changed
-2. exact security model implemented
-3. how PIN is used
-4. how phone authentication works
-5. how LAN and relay transports share the same security protocol
-6. how pairing expiration and single-use work
-7. how private keys are stored on Windows
-8. how phone private keys are stored in the browser
-9. replay-protection design
-10. what the relay can see
-11. what the relay cannot see
-12. tests actually executed and their results
-13. any remaining limitations
 
-Do not merely describe proposed changes. Implement them and verify them.
+
+Reuse the current internal packages.
+
+
+
+Prefer clear boundaries:
+
+
+
+internal/service/
+
+internal/ipc/
+
+internal/config/
+
+internal/protocol/
+
+internal/relay/
+
+internal/server/
+
+internal/tray/
+
+
+
+or an equivalent clean structure.
+
+
+
+Keep platform-specific Windows service code isolated from protocol/business logic.
+
+
+
+Keep interactive UI code isolated from service code.
+
+
+
+Do not modify unrelated UI styling.
+
+
+
+==================================================
+
+30\. FINAL REPORT
+
+==================================================
+
+
+
+After implementation provide:
+
+
+
+1\. Exact files created/modified
+
+2\. New process architecture
+
+3\. Service account used and why
+
+4\. Key-storage design and migration strategy
+
+5\. IPC security design
+
+6\. Installer changes
+
+7\. Uninstall/upgrade behavior
+
+8\. Tests actually executed
+
+9\. Manual Windows acceptance test results
+
+10\. Any remaining limitations
+
+
+
+Do not claim completion without actually building and testing the service.
+
+
+
+The end result must satisfy this exact requirement:
+
+
+
+REBOOT
+
+↓
+
+Windows boot
+
+↓
+
+PC Remote SERVICE starts
+
+↓
+
+Nostr + LAN + crypto initialized
+
+↓
+
+Windows still at PIN/password/fingerprint login screen
+
+↓
+
+PHONE CAN REMOTELY CONTROL PC
+
+
+
+Then:
+
+
+
+USER LOGS IN
+
+↓
+
+PC Remote TRAY starts
+
+↓
+
+QR/settings/UI available
+
+
+
+The service is the always-on remote-control component.
+
+The tray is only the interactive desktop component.
+

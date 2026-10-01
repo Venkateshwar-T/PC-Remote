@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sync"
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
@@ -56,9 +57,12 @@ type ResponsePacket struct {
 // Handler provides unified cryptographic command validation, authorization, and execution
 // regardless of whether the transport is direct LAN HTTP or Nostr relay.
 type Handler struct {
-	cfg         *config.Config
-	pairingMgr  *pairing.Manager
-	replayGuard *ReplayGuard
+	cfg              *config.Config
+	pairingMgr       *pairing.Manager
+	replayGuard      *ReplayGuard
+	onPairingSuccess func()
+	startTime        time.Time
+	mu               sync.RWMutex
 }
 
 func NewHandler(cfg *config.Config, pairingMgr *pairing.Manager, replayGuard *ReplayGuard) *Handler {
@@ -69,7 +73,15 @@ func NewHandler(cfg *config.Config, pairingMgr *pairing.Manager, replayGuard *Re
 		cfg:         cfg,
 		pairingMgr:  pairingMgr,
 		replayGuard: replayGuard,
+		startTime:   time.Now(),
 	}
+}
+
+// SetOnPairingSuccess registers a thread-safe callback invoked whenever a new device pairs successfully.
+func (h *Handler) SetOnPairingSuccess(fn func()) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.onPairingSuccess = fn
 }
 
 // ProcessCommandEvent processes an incoming signed Nostr command event through the unified security pipeline.
@@ -145,6 +157,18 @@ func (h *Handler) ProcessCommandEvent(evt *nostr.Event) (*nostr.Event, error) {
 		return nil, fmt.Errorf("replay rejection: %s", replayErr)
 	}
 
+	// Power state modifications (shutdown, restart, sleep) must be strictly live:
+	// 1. Must NOT precede service startup time (prevents execution of commands queued while PC was off/booting)
+	// 2. Must not exceed 30 seconds of age
+	if cmd.Action == "shutdown" || cmd.Action == "restart" || cmd.Action == "sleep" {
+		if int64(evt.CreatedAt) < h.startTime.Unix() {
+			return nil, fmt.Errorf("power command '%s' rejected: command was sent before service started (offline queue)", cmd.Action)
+		}
+		if time.Now().Unix()-int64(evt.CreatedAt) > 30 {
+			return nil, fmt.Errorf("power command '%s' rejected: event expired (>30s old)", cmd.Action)
+		}
+	}
+
 	// 7. Route and execute authorized actions
 	if cmd.Action == "pair" {
 		// Pairing Handshake Flow:
@@ -181,6 +205,13 @@ func (h *Handler) ProcessCommandEvent(evt *nostr.Event) (*nostr.Event, error) {
 
 		if err := h.cfg.AuthorizeDevice(evt.PubKey, devName); err != nil {
 			return h.BuildEncryptedResponse(evt.PubKey, cmd.ID, "error", "", "Failed to authorize device on laptop", nil)
+		}
+
+		h.mu.RLock()
+		onSuccess := h.onPairingSuccess
+		h.mu.RUnlock()
+		if onSuccess != nil {
+			go onSuccess()
 		}
 
 		telemetry := win32.QueryTelemetry(h.cfg.DeviceName)

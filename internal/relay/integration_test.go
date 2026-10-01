@@ -26,7 +26,10 @@ func TestNostrFlow_PairingAndAuthorizedCommands(t *testing.T) {
 	}
 	_ = cfg.SetPin("123456")
 
-	pairMgr := pairing.NewManager()
+	pairMgr, err := pairing.NewManager()
+	if err != nil {
+		t.Fatal(err)
+	}
 	replayGuard := protocol.NewReplayGuard(120)
 	handler := protocol.NewHandler(cfg, pairMgr, replayGuard)
 	client := NewClient(cfg, nil, handler)

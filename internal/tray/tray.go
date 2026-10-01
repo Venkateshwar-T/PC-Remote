@@ -7,11 +7,12 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sync"
 	"syscall"
 	"unsafe"
 
 	qrcode "github.com/skip2/go-qrcode"
-	"laptopcontrol/internal/config"
+	"laptopcontrol/internal/ipc"
 )
 
 var (
@@ -28,6 +29,7 @@ var (
 	procDefWindowProcW        = modUser32.NewProc("DefWindowProcW")
 	procShowWindow            = modUser32.NewProc("ShowWindow")
 	procUpdateWindow          = modUser32.NewProc("UpdateWindow")
+	procInvalidateRect        = modUser32.NewProc("InvalidateRect")
 	procGetMessageW           = modUser32.NewProc("GetMessageW")
 	procTranslateMessage      = modUser32.NewProc("TranslateMessage")
 	procDispatchMessageW      = modUser32.NewProc("DispatchMessageW")
@@ -192,7 +194,9 @@ type BITMAPINFO struct {
 }
 
 type Manager struct {
-	cfg         *config.Config
+	ipcClient   *ipc.Client
+	deviceName  string
+	urlProvider func() string
 	pairingUrl  string
 	silent      bool
 	onExit      func()
@@ -200,6 +204,7 @@ type Manager struct {
 	nid         NOTIFYICONDATAW
 	hIconBig    uintptr
 	hIconSm     uintptr
+	qrMu        sync.RWMutex
 	qrPixels    []byte
 	qrWidth     int
 	qrHeight    int
@@ -242,7 +247,7 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		case ID_TRAY_CHANGE_PIN:
 			go globalManager.PromptChangePin()
 		case ID_TRAY_OPEN_DASH:
-			exec.Command("rundll32", "url.dll,FileProtocolHandler", globalManager.pairingUrl).Start()
+			exec.Command("rundll32", "url.dll,FileProtocolHandler", globalManager.GetCurrentPairingURL()).Start()
 		case ID_TRAY_EXIT:
 			globalManager.Close()
 		}
@@ -267,22 +272,33 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	return ret
 }
 
-func NewManager(cfg *config.Config, pairingUrl string, silent bool, onExit func()) *Manager {
+func NewManager(ipcClient *ipc.Client, deviceName string, silent bool, onExit func()) *Manager {
 	m := &Manager{
-		cfg:        cfg,
-		pairingUrl: pairingUrl,
+		ipcClient:  ipcClient,
+		deviceName: deviceName,
 		silent:     silent,
 		onExit:     onExit,
 	}
 	globalManager = m
 
+	if ipcClient != nil {
+		if pairInfo, err := ipcClient.GetPairingInfo(); err == nil && pairInfo.URL != "" {
+			m.pairingUrl = pairInfo.URL
+		}
+	}
+
 	// Generate QR Bitmap in memory
-	m.prepareQrBitmap()
+	m.qrMu.Lock()
+	m.prepareQrBitmapLocked()
+	m.qrMu.Unlock()
 
 	return m
 }
 
-func (m *Manager) prepareQrBitmap() {
+func (m *Manager) prepareQrBitmapLocked() {
+	if m.pairingUrl == "" {
+		return
+	}
 	pngBytes, err := qrcode.Encode(m.pairingUrl, qrcode.Medium, 260)
 	if err != nil {
 		return
@@ -312,6 +328,66 @@ func (m *Manager) prepareQrBitmap() {
 		}
 	}
 	m.qrPixels = pixels
+}
+
+// RefreshPairingQR updates the pairing URL from the IPC service and regenerates the QR bitmap.
+// If the pairing window is currently displayed, it automatically invalidates the client area for immediate redraw.
+func (m *Manager) RefreshPairingQR() {
+	var newUrl string
+	if m.ipcClient != nil {
+		if status, err := m.ipcClient.GetStatus(); err == nil && status.DeviceName != "" {
+			m.deviceName = status.DeviceName
+		}
+		if pairInfo, err := m.ipcClient.GetPairingInfo(); err == nil && pairInfo.URL != "" {
+			newUrl = pairInfo.URL
+		}
+	}
+	if newUrl == "" && m.urlProvider != nil {
+		newUrl = m.urlProvider()
+	}
+	if newUrl == "" {
+		return
+	}
+
+	m.qrMu.Lock()
+	if newUrl == m.pairingUrl && len(m.qrPixels) > 0 {
+		hwnd := m.hwnd
+		m.qrMu.Unlock()
+		if hwnd != 0 {
+			procInvalidateRect.Call(hwnd, 0, 1)
+		}
+		return
+	}
+	m.pairingUrl = newUrl
+	m.prepareQrBitmapLocked()
+	hwnd := m.hwnd
+	m.qrMu.Unlock()
+
+	// If pairing window is currently created, trigger dynamic repaint!
+	if hwnd != 0 {
+		procInvalidateRect.Call(hwnd, 0, 1)
+	}
+}
+
+// GetCurrentPairingURL returns the latest dynamic pairing URL
+func (m *Manager) GetCurrentPairingURL() string {
+	if m.ipcClient != nil {
+		if pairInfo, err := m.ipcClient.GetPairingInfo(); err == nil && pairInfo.URL != "" {
+			m.qrMu.Lock()
+			m.pairingUrl = pairInfo.URL
+			m.qrMu.Unlock()
+			return pairInfo.URL
+		}
+	}
+	m.qrMu.RLock()
+	defer m.qrMu.RUnlock()
+	if m.urlProvider != nil {
+		return m.urlProvider()
+	}
+	if m.pairingUrl != "" {
+		return m.pairingUrl
+	}
+	return "https://pc-remote-45t.pages.dev"
 }
 
 func (m *Manager) showContextMenu() {
@@ -375,6 +451,7 @@ func (m *Manager) ShowPairingWindow() {
 	if m.hwnd == 0 {
 		return
 	}
+	m.RefreshPairingQR()
 	forceForeground(m.hwnd)
 	m.isShown = true
 }
@@ -435,24 +512,36 @@ func (m *Manager) onPaint(hwnd uintptr) {
 	}
 
 	// 3. Draw QR Code using SetDIBitsToDevice (260x260) - mathematically centered
-	if len(m.qrPixels) > 0 {
+	m.qrMu.RLock()
+	pixelsLen := len(m.qrPixels)
+	var qrCopy []byte
+	var qrW, qrH int
+	if pixelsLen > 0 {
+		qrCopy = make([]byte, pixelsLen)
+		copy(qrCopy, m.qrPixels)
+		qrW = m.qrWidth
+		qrH = m.qrHeight
+	}
+	m.qrMu.RUnlock()
+
+	if len(qrCopy) > 0 {
 		var bmi BITMAPINFO
 		bmi.Header.Size = uint32(unsafe.Sizeof(bmi.Header))
-		bmi.Header.Width = int32(m.qrWidth)
-		bmi.Header.Height = -int32(m.qrHeight) // Top-down
+		bmi.Header.Width = int32(qrW)
+		bmi.Header.Height = -int32(qrH) // Top-down
 		bmi.Header.Planes = 1
 		bmi.Header.BitCount = 32
 		bmi.Header.Compression = 0 // BI_RGB
 
-		qrX := (clientWidth - m.qrWidth) / 2
+		qrX := (clientWidth - qrW) / 2
 		qrY := 98
 
 		procSetDIBitsToDevice.Call(
 			hdc,
 			uintptr(qrX), uintptr(qrY),
-			uintptr(m.qrWidth), uintptr(m.qrHeight),
-			0, 0, 0, uintptr(m.qrHeight),
-			uintptr(unsafe.Pointer(&m.qrPixels[0])),
+			uintptr(qrW), uintptr(qrH),
+			0, 0, 0, uintptr(qrH),
+			uintptr(unsafe.Pointer(&qrCopy[0])),
 			uintptr(unsafe.Pointer(&bmi)),
 			0,
 		)
@@ -467,8 +556,12 @@ func (m *Manager) onPaint(hwnd uintptr) {
 		rDevice.Left = 0
 		rDevice.Top = 380
 		rDevice.Right = int32(clientWidth)
-		rDevice.Bottom = 408
-		procDrawTextW.Call(hdc, uintptr(unsafe.Pointer(stringToUTF16Ptr(fmt.Sprintf("• %s", m.cfg.DeviceName)))), minusOne, uintptr(unsafe.Pointer(&rDevice)), DT_CENTER|DT_SINGLELINE)
+		rDevice.Bottom = 410
+		devName := m.deviceName
+		if devName == "" {
+			devName = "Windows PC"
+		}
+		procDrawTextW.Call(hdc, uintptr(unsafe.Pointer(stringToUTF16Ptr(fmt.Sprintf("• %s", devName)))), minusOne, uintptr(unsafe.Pointer(&rDevice)), DT_CENTER|DT_SINGLELINE)
 		procSelectObject.Call(hdc, oldFont)
 		procDeleteObject.Call(hFontDevice)
 	}
@@ -650,7 +743,11 @@ func (m *Manager) Close() {
 func (m *Manager) PromptChangePin() {
 	title := "PC Remote - Change Master PIN"
 	header := "Change Master PIN"
-	desc := fmt.Sprintf("Enter a new 6-digit Master PIN for %s.\nYour phone remote will need this new PIN on its next connection.", m.cfg.DeviceName)
+	devName := m.deviceName
+	if devName == "" {
+		devName = "Windows PC"
+	}
+	desc := fmt.Sprintf("Enter a new 6-digit Master PIN for %s.\nYour phone remote will need this new PIN on its next connection.", devName)
 	saveBtn := "Confirm & Update"
 	cancelBtn := "Cancel"
 
@@ -659,13 +756,20 @@ func (m *Manager) PromptChangePin() {
 		return // User cancelled
 	}
 
-	if err := m.cfg.SetPin(newPin); err != nil {
-		procMessageBoxW.Call(
-			m.hwnd,
-			uintptr(unsafe.Pointer(stringToUTF16Ptr("Failed to update PIN: "+err.Error()))),
-			uintptr(unsafe.Pointer(stringToUTF16Ptr("PC Remote - Error"))),
-			0x00000010|0x00040000|0x00010000) // MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND
-		return
+	if m.ipcClient != nil {
+		res, err := m.ipcClient.SetPin("", newPin)
+		if err != nil || !res.Success {
+			errMsg := "Failed to update PIN"
+			if err != nil {
+				errMsg += ": " + err.Error()
+			}
+			procMessageBoxW.Call(
+				m.hwnd,
+				uintptr(unsafe.Pointer(stringToUTF16Ptr(errMsg))),
+				uintptr(unsafe.Pointer(stringToUTF16Ptr("PC Remote - Error"))),
+				0x00000010|0x00040000|0x00010000) // MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND
+			return
+		}
 	}
 
 	m.ShowNotification("Master PIN Updated", fmt.Sprintf("New PIN: %s\nUse this new PIN when connecting from your phone remote.", newPin))

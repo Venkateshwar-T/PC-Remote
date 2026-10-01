@@ -25,7 +25,10 @@ func setupTestEnvironment(t *testing.T) (*config.Config, *pairing.Manager, *Repl
 	}
 	_ = cfg.SetPin("123456")
 
-	pairMgr := pairing.NewManager()
+	pairMgr, err := pairing.NewManager()
+	if err != nil {
+		t.Fatalf("pairing.NewManager failed: %v", err)
+	}
 	replayGuard := NewReplayGuard(120)
 	handler := NewHandler(cfg, pairMgr, replayGuard)
 

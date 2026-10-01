@@ -125,11 +125,25 @@ button {
   background: var(--accent-green);
 }
 
+.status-indicator.connecting {
+  color: var(--accent-amber);
+}
+.status-indicator.connecting .status-dot {
+  background: var(--accent-amber);
+}
+
 .status-indicator.offline {
-  color: var(--accent-red);
+  color: #a1a1aa;
 }
 .status-indicator.offline .status-dot {
-  background: var(--accent-red);
+  background: #71717a;
+}
+
+.status-sub-text {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  margin-top: 1px;
 }
 
 .btn-refresh {
@@ -323,11 +337,11 @@ button {
 .metric-icon-wrap {
   display: flex;
   align-items: center;
-  gap: 5px;
   font-size: 10px;
-  font-weight: 500;
+  font-weight: 600;
   color: var(--text-muted);
   text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 .metric-icon {
@@ -408,6 +422,12 @@ button {
 
 .btn-control:active:not(:disabled) {
   transform: scale(0.99);
+}
+
+.btn-control:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  filter: grayscale(0.5);
 }
 
 .control-left {

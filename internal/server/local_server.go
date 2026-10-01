@@ -17,12 +17,15 @@ import (
 	"laptopcontrol/internal/qr"
 )
 
+const DefaultMaxConcurrentControl = 8
+
 type Server struct {
 	cfg        *config.Config
 	webFS      fs.FS
 	port       int
 	pairingMgr *pairing.Manager
 	handler    *protocol.Handler
+	controlSem chan struct{}
 	mu         sync.RWMutex
 }
 
@@ -33,7 +36,18 @@ func NewServer(cfg *config.Config, webFS fs.FS, port int, pairingMgr *pairing.Ma
 		port:       port,
 		pairingMgr: pairingMgr,
 		handler:    handler,
+		controlSem: make(chan struct{}, DefaultMaxConcurrentControl),
 	}
+}
+
+// SetControlConcurrency overrides the concurrency limit on /api/control (useful for tests)
+func (s *Server) SetControlConcurrency(limit int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit <= 0 {
+		limit = DefaultMaxConcurrentControl
+	}
+	s.controlSem = make(chan struct{}, limit)
 }
 
 // GetLocalIPv4 returns the preferred outbound LAN IPv4 address
@@ -186,6 +200,24 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+
+	// 1. Bound concurrency: limit concurrent cryptographic operations to protect CPU and memory
+	s.mu.RLock()
+	sem := s.controlSem
+	s.mu.RUnlock()
+
+	select {
+	case sem <- struct{}{}:
+		defer func() { <-sem }()
+	default:
+		// Saturated: Fail fast with 429 Too Many Requests
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "Server busy: maximum concurrent control operations reached. Please retry shortly.",
+		})
+		return
+	}
 
 	// Security: Limit request body to 64KB to prevent DoS memory exhaustion
 	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)

@@ -82,8 +82,8 @@ func (c *Client) Stop() {
 
 func (c *Client) listenLoop() {
 	// Subscribe to direct message events (Kind 4) tagged with laptop's public key
-	// Listen for events created within the last 60 seconds to avoid processing historical backlogs
-	since := nostr.Timestamp(time.Now().Unix() - 60)
+	// Listen exclusively for live events created from this moment onwards to avoid processing historical offline backlogs
+	since := nostr.Timestamp(time.Now().Unix())
 	filter := nostr.Filter{
 		Kinds: []int{4},
 		Tags:  nostr.TagMap{"p": []string{c.cfg.LaptopPubKey}},

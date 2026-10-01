@@ -55,13 +55,14 @@ function createMockEnvironment(initialHash = '', initialStorage = {}) {
     'landingStateView', 'landingIconWrap', 'landingTitle', 'landingDesc',
     'landingBadge', 'landingBadgeText', 'btnLandingAction', 'pinView',
     'pinTitle', 'pinSubtitle', 'pinError', 'mainDashboard', 'deviceName',
-    'statusIndicator', 'statusLabel', 'btnRefresh', 'networkName',
+    'statusIndicator', 'statusLabel', 'statusSub', 'btnRefresh', 'networkName',
     'networkType', 'batteryFill', 'batteryPercentText', 'batteryLightning',
     'cpuValue', 'cpuMeter', 'ramValue', 'ramMeter', 'ramGb', 'uptimeValue',
     'btnLock', 'lockName', 'lockDesc', 'lockRight', 'btnSleep', 'btnRestart',
     'btnShutdown', 'confirmModal', 'modalTitle', 'modalDesc', 'btnModalCancel',
     'btnModalConfirm', 'toast', 'toastText', 'actionStateView', 'stateIconWrap',
-    'stateTitle', 'stateDesc', 'stateBadgeDot', 'stateBadgeText', 'btnStateAction'
+    'stateTitle', 'stateDesc', 'stateBadgeDot', 'stateBadgeText', 'btnStateAction',
+    'btnStateDismiss'
   ];
   for (let i = 0; i < 6; i++) elementIDs.push('dot' + i);
   elementIDs.forEach(id => getElement(id));
@@ -83,6 +84,12 @@ function createMockEnvironment(initialHash = '', initialStorage = {}) {
       }
     },
     localStorage: {
+      getItem(k) { return storage[k] !== undefined ? storage[k] : null; },
+      setItem(k, v) { storage[k] = String(v); },
+      removeItem(k) { delete storage[k]; },
+      clear() { for (let k in storage) delete storage[k]; }
+    },
+    sessionStorage: {
       getItem(k) { return storage[k] !== undefined ? storage[k] : null; },
       setItem(k, v) { storage[k] = String(v); },
       removeItem(k) { delete storage[k]; },
@@ -124,6 +131,7 @@ async function runInMock(initialHash = '', initialStorage = {}) {
     window: env.mockWindow,
     document: env.mockWindow.document,
     localStorage: env.mockWindow.localStorage,
+    sessionStorage: env.mockWindow.sessionStorage,
     navigator: env.mockWindow.navigator,
     crypto: globalThis.crypto,
     WebSocket: env.mockWindow.WebSocket,
@@ -339,8 +347,53 @@ async function main() {
     console.log('  -> PASS: Tampering with isPaired=true cannot bypass cryptographic unlock.\n');
   }
 
+  // --- TEST J: Action State Persistence Across Page Refresh ---
+  console.log('Testing Case J: Action State Persistence Across Page Refresh...');
+  {
+    const validKey = '81f424aec50fd8eee2e5bae94a719a44ec2ea11eff350d3ed8f955e23732de47';
+    const phonePrivkey = '1111111111111111111111111111111111111111111111111111111111111111';
+
+    const enc = new TextEncoder();
+    const saltBytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
+    const ivBytes = globalThis.crypto.getRandomValues(new Uint8Array(12));
+    const pinKey = await globalThis.crypto.subtle.importKey('raw', enc.encode('123456'), { name: 'PBKDF2' }, false, ['deriveKey']);
+    const aesKey = await globalThis.crypto.subtle.deriveKey(
+      { name: 'PBKDF2', salt: saltBytes, iterations: 100000, hash: 'SHA-256' },
+      pinKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
+    );
+    const ctBuffer = await globalThis.crypto.subtle.encrypt({ name: 'AES-GCM', iv: ivBytes }, aesKey, enc.encode(phonePrivkey));
+
+    const initialStorage = {
+      pcremote_vault_auth: JSON.stringify({
+        laptopPubkey: validKey,
+        phonePubkey: '2222222222222222222222222222222222222222222222222222222222222222',
+        saltHex: Array.from(saltBytes).map(b => b.toString(16).padStart(2, '0')).join(''),
+        ivHex: Array.from(ivBytes).map(b => b.toString(16).padStart(2, '0')).join(''),
+        ciphertextHex: Array.from(new Uint8Array(ctBuffer)).map(b => b.toString(16).padStart(2, '0')).join(''),
+        deviceName: 'Home-PC',
+        isPaired: true
+      }),
+      pcremote_action_state: JSON.stringify({
+        action: 'shutdown',
+        timestamp: Date.now()
+      })
+    };
+
+    const env = await runInMock('', initialStorage);
+    assert.strictEqual(env.elements.pinView.style.display, 'flex', 'PIN view must be shown on fresh load');
+
+    // Unlock session with correct PIN
+    await env.mockWindow.__verifyPin('123456');
+
+    // After shutdown, actionStateView MUST be shown instead of mainDashboard!
+    assert.strictEqual(env.elements.actionStateView.style.display, 'flex', 'Action state view MUST be shown after refresh');
+    assert.strictEqual(env.elements.mainDashboard.style.display, 'none', 'Dashboard MUST remain hidden while PC is in shutdown state');
+    assert.strictEqual(env.elements.stateTitle.textContent, 'PC is Powered Off', 'Must indicate PC is Powered Off');
+    console.log('  -> PASS: Action state persisted across refresh; action view shown, dashboard safely hidden.\n');
+  }
+
   console.log('========================================================');
-  console.log('  ALL PWA STATE MACHINE & SECURITY TESTS PASSED (9/9)');
+  console.log('  ALL PWA STATE MACHINE & SECURITY TESTS PASSED (10/10)');
   console.log('========================================================\n');
 }
 
