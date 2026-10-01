@@ -242,17 +242,23 @@ func checkAndMigrateLegacyConfig(client *ipc.Client, legacyDir string) {
 		return // No legacy config file found
 	}
 
-	var disk struct {
-		LaptopPrivKeyDPAPI string `json:"laptopPrivKeyEncrypted"`
-		LaptopPrivKey      string `json:"laptopPrivKey"`
+	var legacy struct {
+		PinHash            string                    `json:"pinHash"`
+		PinSalt            string                    `json:"pinSalt"`
+		DeviceName         string                    `json:"deviceName"`
+		LaptopPrivKeyDPAPI string                    `json:"laptopPrivKeyEncrypted"`
+		LaptopPrivKey      string                    `json:"laptopPrivKey"`
+		LaptopPubKey       string                    `json:"laptopPubKey"`
+		AuthorizedDevices  map[string]ipc.DeviceInfo `json:"authorizedDevices"`
 	}
-	if err := json.Unmarshal(data, &disk); err != nil {
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		log.Printf("[Migration] Warning: unmarshaling legacy config failed: %v", err)
 		return
 	}
 
 	var plainKey string
-	if disk.LaptopPrivKeyDPAPI != "" {
-		cipherBytes, err := base64.StdEncoding.DecodeString(disk.LaptopPrivKeyDPAPI)
+	if legacy.LaptopPrivKeyDPAPI != "" {
+		cipherBytes, err := base64.StdEncoding.DecodeString(legacy.LaptopPrivKeyDPAPI)
 		if err == nil {
 			plainBytes, errDec := config.DecryptDPAPI(cipherBytes)
 			if errDec == nil && len(plainBytes) > 0 {
@@ -260,25 +266,38 @@ func checkAndMigrateLegacyConfig(client *ipc.Client, legacyDir string) {
 			}
 		}
 	}
-	if plainKey == "" && disk.LaptopPrivKey != "" {
-		plainKey = disk.LaptopPrivKey
+	if plainKey == "" && legacy.LaptopPrivKey != "" {
+		plainKey = legacy.LaptopPrivKey
 	}
 
 	if plainKey == "" {
 		return
 	}
 
-	// Verify key validity
+	// Verify BIP-340 key validity before transmission
 	if _, err := nostr.GetPublicKey(plainKey); err != nil {
+		log.Printf("[Migration] Warning: invalid legacy keypair: %v", err)
 		return
 	}
 
+	params := ipc.MigrateKeyParams{
+		PrivateKey:        plainKey,
+		PinHash:           legacy.PinHash,
+		PinSalt:           legacy.PinSalt,
+		DeviceName:        legacy.DeviceName,
+		AuthorizedDevices: legacy.AuthorizedDevices,
+	}
+
 	// Send over local IPC to service
-	res, err := client.MigrateLegacyKey(plainKey)
-	if err == nil && res.Success {
-		log.Println("[Migration] Successfully migrated legacy cryptographic identity to background service")
+	res, err := client.MigrateLegacyKey(params)
+	if err == nil && res != nil && res.Success {
+		log.Println("[Migration] Successfully migrated legacy configuration to background service")
 		// Safely rename obsolete file so it is never migrated twice
-		_ = os.Rename(legacyFile, legacyFile+".migrated")
+		migratedFile := legacyFile + ".migrated"
+		_ = os.Remove(migratedFile)
+		_ = os.Rename(legacyFile, migratedFile)
+	} else {
+		log.Printf("[Migration] Warning: legacy migration was not confirmed by service; leaving file for retry")
 	}
 }
 

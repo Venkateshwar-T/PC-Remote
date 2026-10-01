@@ -301,3 +301,143 @@ func TestConfig_UpdateDeviceLastSeen_ConcurrentRaceSafety(t *testing.T) {
 	wg.Wait()
 	_ = cfg.Flush()
 }
+
+func TestConfig_AtomicWriteFile(t *testing.T) {
+	tempDir := t.TempDir()
+	targetPath := filepath.Join(tempDir, "atomic_test.json")
+
+	initialData := []byte(`{"version": 1}`)
+	if err := atomicWriteFile(targetPath, initialData, 0600); err != nil {
+		t.Fatalf("atomicWriteFile failed initial write: %v", err)
+	}
+
+	readData, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("Failed to read initial file: %v", err)
+	}
+	if string(readData) != string(initialData) {
+		t.Fatalf("Content mismatch! Got %s, expected %s", readData, initialData)
+	}
+
+	// Overwrite atomically
+	updatedData := []byte(`{"version": 2, "updated": true}`)
+	if err := atomicWriteFile(targetPath, updatedData, 0600); err != nil {
+		t.Fatalf("atomicWriteFile failed overwrite: %v", err)
+	}
+
+	readData, err = os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("Failed to read updated file: %v", err)
+	}
+	if string(readData) != string(updatedData) {
+		t.Fatalf("Content mismatch! Got %s, expected %s", readData, updatedData)
+	}
+
+	// Ensure temp file does not remain
+	if _, err := os.Stat(targetPath + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("Temp file %s.tmp was not cleaned up!", targetPath)
+	}
+}
+
+func TestConfig_DirectorySecurityVerification(t *testing.T) {
+	// A regular temp dir inherits user permissions from %TEMP%, so it must fail strict DACL verification
+	tempDir := t.TempDir()
+	err := VerifyDirectorySecurity(tempDir)
+	if err == nil {
+		t.Fatal("Expected VerifyDirectorySecurity to fail on unhardened temp directory, but it passed!")
+	}
+
+	// If ProgramData\PC Remote exists on this Windows host, it should pass verification
+	svcDir := GetServiceConfigDir()
+	if info, err := os.Stat(svcDir); err == nil && info.IsDir() {
+		if err := VerifyDirectorySecurity(svcDir); err != nil {
+			t.Fatalf("VerifyDirectorySecurity failed on authoritative service dir %s: %v", svcDir, err)
+		}
+	}
+}
+
+func TestConfig_MigrateLegacyConfigComprehensive(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg, err := LoadOrCreate(tempDir)
+	if err != nil {
+		t.Fatalf("Failed to initialize config: %v", err)
+	}
+
+	initialPub := cfg.LaptopPubKey
+
+	legacyKey := nostr.GeneratePrivateKey()
+	expectedPub, err := nostr.GetPublicKey(legacyKey)
+	if err != nil {
+		t.Fatalf("Failed to derive pubkey: %v", err)
+	}
+
+	// 1. Invalid migration: bad key length
+	err = cfg.MigrateLegacyConfig(LegacyConfigData{
+		PrivateKey: "shortkey",
+	})
+	if err == nil {
+		t.Fatal("Expected error migrating short key")
+	}
+	if cfg.LaptopPubKey != initialPub {
+		t.Fatal("Failed migration must not alter existing public key")
+	}
+
+	// 2. Valid migration with PIN, DeviceName, and AuthorizedDevices
+	legacyData := LegacyConfigData{
+		PrivateKey: legacyKey,
+		PinHash:    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		PinSalt:    "abcdef0123456789abcdef0123456789",
+		DeviceName: "My Custom Workstation",
+		AuthorizedDevices: map[string]DeviceInfo{
+			"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789": {
+				Name:     "Pixel 8",
+				AddedAt:  time.Now(),
+				LastSeen: time.Now(),
+			},
+		},
+	}
+
+	if err := cfg.MigrateLegacyConfig(legacyData); err != nil {
+		t.Fatalf("MigrateLegacyConfig failed: %v", err)
+	}
+
+	if cfg.LaptopPubKey != expectedPub {
+		t.Fatalf("Public key mismatch after migration: got %s, expected %s", cfg.LaptopPubKey, expectedPub)
+	}
+	if cfg.DeviceName != "My Custom Workstation" {
+		t.Fatalf("DeviceName not preserved: got %s", cfg.DeviceName)
+	}
+	if cfg.PinHash != legacyData.PinHash {
+		t.Fatalf("PinHash not preserved: got %s", cfg.PinHash)
+	}
+	if cfg.PinSalt != legacyData.PinSalt {
+		t.Fatalf("PinSalt not preserved: got %s", cfg.PinSalt)
+	}
+	if len(cfg.AuthorizedDevices) != 1 {
+		t.Fatalf("AuthorizedDevices not preserved: count=%d", len(cfg.AuthorizedDevices))
+	}
+
+	// 3. Verify disk file has NO plaintext key
+	rawDisk, err := os.ReadFile(filepath.Join(tempDir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rawDisk), legacyKey) {
+		t.Fatal("Security violation: Plaintext private key found on disk after migration!")
+	}
+
+	// 4. Verify idempotent reload
+	reloaded, err := LoadOrCreate(tempDir)
+	if err != nil {
+		t.Fatalf("Reload failed: %v", err)
+	}
+	if reloaded.LaptopPubKey != expectedPub {
+		t.Fatalf("Reload public key mismatch: got %s, expected %s", reloaded.LaptopPubKey, expectedPub)
+	}
+	if reloaded.PinHash != legacyData.PinHash {
+		t.Fatalf("Reload PinHash mismatch: got %s", reloaded.PinHash)
+	}
+	if len(reloaded.AuthorizedDevices) != 1 {
+		t.Fatalf("Reload AuthorizedDevices mismatch: count=%d", len(reloaded.AuthorizedDevices))
+	}
+}

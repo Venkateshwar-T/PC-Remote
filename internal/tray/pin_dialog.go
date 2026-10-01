@@ -283,4 +283,3 @@ func PromptInitialPinSetup(deviceName string) (string, bool) {
 	// Success! Return PIN directly so app transitions smoothly to QR pairing window
 	return pin, true
 }
-

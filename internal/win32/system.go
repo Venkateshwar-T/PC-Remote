@@ -292,4 +292,3 @@ func QueryTelemetry(deviceName string) TelemetryData {
 		IsLocked:      locked,
 	}
 }
-

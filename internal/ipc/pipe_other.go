@@ -14,11 +14,29 @@ type PipeConn struct {
 	net.Conn
 }
 
-type PipeListener struct {
-	closed bool
+type ClientIdentity struct {
+	SID      string
+	IsAdmin  bool
+	IsSystem bool
 }
 
-func ListenPipe(pipeName string) (*PipeListener, error) {
+func BuildRestrictedSDDL(userSID string) string {
+	return ""
+}
+
+func GetActiveConsoleUserSID() (string, error) {
+	return "", errNotSupported
+}
+
+func GetCurrentProcessUserSID() (string, error) {
+	return "", errNotSupported
+}
+
+func GetClientIdentity(h interface{}) (*ClientIdentity, error) {
+	return &ClientIdentity{IsAdmin: true, IsSystem: true}, nil
+}
+
+func ListenPipe(pipeName string, authorizedSID ...string) (*PipeListener, error) {
 	return nil, errNotSupported
 }
 

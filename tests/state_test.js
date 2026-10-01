@@ -392,8 +392,45 @@ async function main() {
     console.log('  -> PASS: Action state persisted across refresh; action view shown, dashboard safely hidden.\n');
   }
 
+  // Case K: Initial UI Flash Invariant (pinView must be hidden before evaluation)
+  {
+    console.log('Testing Case K: Initial UI Flash Invariant (pinView hidden by default)...');
+    const htmlContent = fs.readFileSync('web/index.html', 'utf8');
+    const cssContent = fs.readFileSync('web/style.css', 'utf8');
+
+    // 1. Assert HTML template has pinView hidden by default
+    assert.match(
+      htmlContent,
+      /<div\s+id="pinView"[^>]*style="[^"]*display:\s*none;?[^"]*"/i,
+      'web/index.html must have pinView hidden by default (style="display: none;")'
+    );
+
+    // 2. Assert HTML template has landingStateView hidden by default
+    assert.match(
+      htmlContent,
+      /<div\s+id="landingStateView"[^>]*style="[^"]*display:\s*none;?[^"]*"/i,
+      'web/index.html must have landingStateView hidden by default'
+    );
+
+    // 3. Assert HTML template has mainDashboard hidden by default
+    assert.match(
+      htmlContent,
+      /<div\s+id="mainDashboard"[^>]*style="[^"]*display:\s*none;?[^"]*"/i,
+      'web/index.html must have mainDashboard hidden by default'
+    );
+
+    // 4. Assert CSS baseline has .pin-view hidden by default
+    assert.match(
+      cssContent,
+      /\.pin-view\s*\{[^}]*display:\s*none;/s,
+      'web/style.css must have .pin-view { display: none; } baseline'
+    );
+
+    console.log('  -> PASS: Initial UI flash invariant verified; all top-level views start hidden.\n');
+  }
+
   console.log('========================================================');
-  console.log('  ALL PWA STATE MACHINE & SECURITY TESTS PASSED (10/10)');
+  console.log('  ALL PWA STATE MACHINE & SECURITY TESTS PASSED (11/11)');
   console.log('========================================================\n');
 }
 

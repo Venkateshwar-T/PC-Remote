@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -20,40 +21,49 @@ type Handlers struct {
 	RotatePairingToken func() (*PairingInfoResult, error)
 	GetPinStatus       func() (*PinStatusResult, error)
 	SetPin             func(oldPin, newPin string) (*SetPinResult, error)
-	MigrateLegacyKey   func(privateKey string) (*MigrateKeyResult, error)
+	MigrateLegacyKey   func(params MigrateKeyParams) (*MigrateKeyResult, error)
 	StopService        func() (*StopServiceResult, error)
 }
 
 // Server manages the local IPC Named Pipe server
 type Server struct {
-	pipeName string
-	handlers Handlers
-	listener *PipeListener
-	wg       sync.WaitGroup
-	mu       sync.Mutex
-	closed   bool
-	sem      chan struct{}
+	pipeName      string
+	handlers      Handlers
+	listener      *PipeListener
+	wg            sync.WaitGroup
+	mu            sync.Mutex
+	closed        bool
+	sem           chan struct{}
+	authorizedSID string
 }
 
 // NewServer initializes an IPC server with the specified pipe name and operation handlers
-func NewServer(pipeName string, handlers Handlers) *Server {
+func NewServer(pipeName string, handlers Handlers, authorizedSID ...string) *Server {
 	if pipeName == "" {
 		pipeName = PipeName
 	}
+	var sid string
+	if len(authorizedSID) > 0 {
+		sid = authorizedSID[0]
+	}
 	return &Server{
-		pipeName: pipeName,
-		handlers: handlers,
-		sem:      make(chan struct{}, 8), // Max 8 concurrent local IPC client connections
+		pipeName:      pipeName,
+		handlers:      handlers,
+		sem:           make(chan struct{}, 8), // Max 8 concurrent local IPC client connections
+		authorizedSID: sid,
 	}
 }
 
 // Start begins listening and serving local IPC clients
 func (s *Server) Start() error {
-	l, err := ListenPipe(s.pipeName)
+	l, err := ListenPipe(s.pipeName, s.authorizedSID)
 	if err != nil {
 		return fmt.Errorf("failed to listen on IPC pipe %s: %w", s.pipeName, err)
 	}
 	s.listener = l
+	if s.authorizedSID == "" && l.authorizedSID != "" {
+		s.authorizedSID = l.authorizedSID
+	}
 
 	s.wg.Add(1)
 	go s.serve()
@@ -116,6 +126,8 @@ func (s *Server) handleConn(conn *PipeConn) {
 	defer conn.Close()
 
 	reader := bufio.NewReader(conn)
+	var clientVerified bool
+
 	for {
 		line, isPrefix, err := reader.ReadLine()
 		if err != nil {
@@ -123,6 +135,22 @@ func (s *Server) handleConn(conn *PipeConn) {
 				return
 			}
 			return
+		}
+
+		// Defense in depth: Verify connecting client's Windows security identity.
+		// Windows named pipe impersonation requires data to have been read from the pipe.
+		if !clientVerified {
+			ident, err := GetClientIdentity(conn.handle)
+			if err != nil {
+				log.Printf("[IPC] Client identity verification error: %v", err)
+				return
+			}
+
+			if !s.isClientAuthorized(ident) {
+				log.Printf("[IPC] Connection rejected: unauthorized Windows client (SID: %s, Admin: %v, System: %v)", ident.SID, ident.IsAdmin, ident.IsSystem)
+				return
+			}
+			clientVerified = true
 		}
 
 		if isPrefix {
@@ -223,10 +251,15 @@ func (s *Server) dispatch(req *Request) Response {
 			return Response{ID: req.ID, Error: "Method not implemented"}
 		}
 		var p MigrateKeyParams
-		if err := json.Unmarshal(req.Params, &p); err != nil {
-			return Response{ID: req.ID, Error: "Invalid MigrateLegacyKey parameters"}
+		if err := json.Unmarshal(req.Params, &p); err != nil || p.PrivateKey == "" {
+			var rawKey string
+			if errRaw := json.Unmarshal(req.Params, &rawKey); errRaw == nil && rawKey != "" {
+				p.PrivateKey = rawKey
+			} else if err != nil {
+				return Response{ID: req.ID, Error: "Invalid MigrateLegacyKey parameters"}
+			}
 		}
-		res, err := s.handlers.MigrateLegacyKey(p.PrivateKey)
+		res, err := s.handlers.MigrateLegacyKey(p)
 		return s.formatResponse(req.ID, res, err)
 
 	case MethodStopService:
@@ -263,4 +296,19 @@ func (s *Server) formatResponse(id string, result interface{}, err error) Respon
 		ID:     id,
 		Result: raw,
 	}
+}
+
+func (s *Server) isClientAuthorized(ident *ClientIdentity) bool {
+	if ident == nil {
+		return false
+	}
+	// SYSTEM and Administrators are always authorized to administer the service
+	if ident.IsSystem || ident.IsAdmin {
+		return true
+	}
+	// Authorized user account
+	if s.authorizedSID != "" && strings.EqualFold(ident.SID, s.authorizedSID) {
+		return true
+	}
+	return false
 }

@@ -1,6 +1,9 @@
 package ipc
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"time"
+)
 
 const (
 	PipeName        = `\\.\pipe\PCRemote`
@@ -68,9 +71,20 @@ type SetPinResult struct {
 	Message string `json:"message,omitempty"`
 }
 
-// MigrateKeyParams carries a decrypted private key across local IPC for service DPAPI re-encryption
+// DeviceInfo represents an authorized device metadata
+type DeviceInfo struct {
+	Name     string    `json:"name"`
+	AddedAt  time.Time `json:"addedAt"`
+	LastSeen time.Time `json:"lastSeen"`
+}
+
+// MigrateKeyParams carries a decrypted private key and compatible legacy configuration across local IPC for service DPAPI re-encryption and adoption
 type MigrateKeyParams struct {
-	PrivateKey string `json:"privateKey"`
+	PrivateKey        string                `json:"privateKey"`
+	PinHash           string                `json:"pinHash,omitempty"`
+	PinSalt           string                `json:"pinSalt,omitempty"`
+	DeviceName        string                `json:"deviceName,omitempty"`
+	AuthorizedDevices map[string]DeviceInfo `json:"authorizedDevices,omitempty"`
 }
 
 // MigrateKeyResult reports legacy migration outcome

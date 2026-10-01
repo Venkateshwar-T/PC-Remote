@@ -10,11 +10,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
@@ -65,9 +63,9 @@ func pbkdf2Sha256(password, salt []byte, iter, keyLen int) []byte {
 }
 
 type DeviceInfo struct {
-	Name      string    `json:"name"`
-	AddedAt   time.Time `json:"addedAt"`
-	LastSeen  time.Time `json:"lastSeen"`
+	Name     string    `json:"name"`
+	AddedAt  time.Time `json:"addedAt"`
+	LastSeen time.Time `json:"lastSeen"`
 }
 
 type Config struct {
@@ -80,6 +78,7 @@ type Config struct {
 	PinHash            string                `json:"pinHash"`
 	PinSalt            string                `json:"pinSalt"`
 	DeviceName         string                `json:"deviceName"`
+	AuthorizedUserSID  string                `json:"authorizedUserSID,omitempty"`
 	LaptopPrivKeyDPAPI string                `json:"laptopPrivKeyEncrypted,omitempty"`
 	LaptopPrivKey      string                `json:"-"` // Stored in-memory only; NEVER written as plaintext to disk
 	LaptopPubKey       string                `json:"laptopPubKey"`
@@ -93,6 +92,7 @@ type diskRepresentation struct {
 	PinHash            string                `json:"pinHash"`
 	PinSalt            string                `json:"pinSalt"`
 	DeviceName         string                `json:"deviceName"`
+	AuthorizedUserSID  string                `json:"authorizedUserSID,omitempty"`
 	LaptopPrivKey      string                `json:"laptopPrivKey,omitempty"` // Legacy plaintext field
 	LaptopPrivKeyDPAPI string                `json:"laptopPrivKeyEncrypted,omitempty"`
 	LaptopPubKey       string                `json:"laptopPubKey"`
@@ -117,6 +117,7 @@ func LoadOrCreate(baseDir string) (*Config, error) {
 			cfg.PinHash = disk.PinHash
 			cfg.PinSalt = disk.PinSalt
 			cfg.DeviceName = disk.DeviceName
+			cfg.AuthorizedUserSID = disk.AuthorizedUserSID
 			cfg.LaptopPubKey = disk.LaptopPubKey
 			cfg.AuthorizedDevices = disk.AuthorizedDevices
 			cfg.FailedAttempts = disk.FailedAttempts
@@ -401,7 +402,7 @@ func (c *Config) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	err = os.WriteFile(c.filePath, data, 0600)
+	err = atomicWriteFile(c.filePath, data, 0600)
 	if err == nil {
 		c.isDirty = false
 		c.lastSaveTime = time.Now()
@@ -423,38 +424,152 @@ func GetServiceConfigPath() string {
 	return filepath.Join(GetServiceConfigDir(), "config.json")
 }
 
-// SetupDirectorySecurity ensures the specified directory exists and has restricted ACLs
+// SetupDirectorySecurity ensures the specified directory exists and enforces secure ACLs.
+// When configuring the authoritative service config directory, inheritance is stripped,
+// full control is granted to SYSTEM and Administrators, and unprivileged Users access is removed.
+// If applying or verifying the security descriptor fails, an error is returned (fail-closed).
 func SetupDirectorySecurity(dir string) error {
 	if err := os.MkdirAll(dir, 0750); err != nil {
-		return err
+		return fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 	// Only apply machine ACLs when managing the authoritative service config directory
 	if strings.EqualFold(filepath.Clean(dir), filepath.Clean(GetServiceConfigDir())) {
-		cmd := exec.Command("icacls.exe", dir, "/grant:r", "SYSTEM:(OI)(CI)F", "Administrators:(OI)(CI)F")
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-		_ = cmd.Run()
+		if err := ApplyDirectorySecurity(dir); err != nil {
+			return fmt.Errorf("failed to apply directory security on %s: %w", dir, err)
+		}
+		if err := VerifyDirectorySecurity(dir); err != nil {
+			return fmt.Errorf("failed to verify directory security on %s: %w", dir, err)
+		}
 	}
 	return nil
 }
 
-// MigrateKey securely updates the private key in-memory, re-encrypts with DPAPI, and saves to disk
-func (c *Config) MigrateKey(privateKey string) error {
+// LegacyConfigData carries compatible configuration fields for safe migration
+type LegacyConfigData struct {
+	PrivateKey        string
+	PinHash           string
+	PinSalt           string
+	DeviceName        string
+	AuthorizedDevices map[string]DeviceInfo
+}
+
+// MigrateLegacyConfig safely validates legacy data, adopts compatible fields, re-encrypts the private key with service DPAPI, writes atomically, and verifies successful loading and DPAPI decryption.
+func (c *Config) MigrateLegacyConfig(data LegacyConfigData) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	derivedPub, err := nostr.GetPublicKey(privateKey)
+	// 1. Validate private key (BIP-340 secp256k1 64 hex characters)
+	if len(data.PrivateKey) != 64 {
+		return fmt.Errorf("invalid private key length: expected 64 hex characters")
+	}
+	derivedPub, err := nostr.GetPublicKey(data.PrivateKey)
 	if err != nil {
 		return fmt.Errorf("invalid Nostr private key: %w", err)
 	}
 
-	encBytes, err := EncryptDPAPI([]byte(privateKey))
+	// 2. Validate PIN fields if provided
+	if data.PinHash != "" || data.PinSalt != "" {
+		if data.PinHash == "" || data.PinSalt == "" {
+			return fmt.Errorf("incomplete PIN configuration: both hash and salt are required")
+		}
+		if _, err := hex.DecodeString(data.PinHash); err != nil {
+			return fmt.Errorf("invalid PIN hash hex encoding")
+		}
+		if _, err := hex.DecodeString(data.PinSalt); err != nil {
+			return fmt.Errorf("invalid PIN salt hex encoding")
+		}
+	}
+
+	// 3. Encrypt private key with service DPAPI
+	encBytes, err := EncryptDPAPI([]byte(data.PrivateKey))
 	if err != nil {
 		return fmt.Errorf("failed to encrypt private key with service DPAPI: %w", err)
 	}
 
-	c.LaptopPrivKey = privateKey
+	// Snapshot current state in case write or verify fails
+	origPrivKey := c.LaptopPrivKey
+	origPubKey := c.LaptopPubKey
+	origDPAPI := c.LaptopPrivKeyDPAPI
+	origPinHash := c.PinHash
+	origPinSalt := c.PinSalt
+	origDevName := c.DeviceName
+	origDevices := make(map[string]DeviceInfo)
+	for k, v := range c.AuthorizedDevices {
+		origDevices[k] = v
+	}
+
+	// Apply validated configuration
+	c.LaptopPrivKey = data.PrivateKey
 	c.LaptopPubKey = derivedPub
 	c.LaptopPrivKeyDPAPI = base64.StdEncoding.EncodeToString(encBytes)
-	return c.saveLocked()
+
+	// Adopt legacy PIN if current service config does not have one
+	if c.PinHash == "" && data.PinHash != "" {
+		c.PinHash = data.PinHash
+		c.PinSalt = data.PinSalt
+	}
+
+	// Adopt device name if legacy configuration specified one
+	if data.DeviceName != "" {
+		c.DeviceName = data.DeviceName
+	}
+
+	// Adopt authorized devices
+	if len(data.AuthorizedDevices) > 0 {
+		if c.AuthorizedDevices == nil {
+			c.AuthorizedDevices = make(map[string]DeviceInfo)
+		}
+		for pk, dev := range data.AuthorizedDevices {
+			if len(pk) == 64 {
+				if _, exists := c.AuthorizedDevices[pk]; !exists {
+					c.AuthorizedDevices[pk] = dev
+				}
+			}
+		}
+	}
+
+	// 4. Save atomically
+	if err := c.saveLocked(); err != nil {
+		c.LaptopPrivKey = origPrivKey
+		c.LaptopPubKey = origPubKey
+		c.LaptopPrivKeyDPAPI = origDPAPI
+		c.PinHash = origPinHash
+		c.PinSalt = origPinSalt
+		c.DeviceName = origDevName
+		c.AuthorizedDevices = origDevices
+		return fmt.Errorf("failed to write migrated config: %w", err)
+	}
+
+	// 5. Verification: Read back from disk and verify DPAPI decryption and key derivation
+	verifyCfg, err := LoadOrCreate(filepath.Dir(c.filePath))
+	if err != nil {
+		c.LaptopPrivKey = origPrivKey
+		c.LaptopPubKey = origPubKey
+		c.LaptopPrivKeyDPAPI = origDPAPI
+		c.PinHash = origPinHash
+		c.PinSalt = origPinSalt
+		c.DeviceName = origDevName
+		c.AuthorizedDevices = origDevices
+		_ = c.saveLocked()
+		return fmt.Errorf("verification of migrated config file failed: %w", err)
+	}
+
+	if verifyCfg.LaptopPubKey != derivedPub || verifyCfg.LaptopPrivKey != data.PrivateKey {
+		c.LaptopPrivKey = origPrivKey
+		c.LaptopPubKey = origPubKey
+		c.LaptopPrivKeyDPAPI = origDPAPI
+		c.PinHash = origPinHash
+		c.PinSalt = origPinSalt
+		c.DeviceName = origDevName
+		c.AuthorizedDevices = origDevices
+		_ = c.saveLocked()
+		return fmt.Errorf("verification of decrypted migrated identity failed")
+	}
+
+	return nil
 }
 
+// MigrateKey is a convenience wrapper for MigrateLegacyConfig with only a private key
+func (c *Config) MigrateKey(privateKey string) error {
+	return c.MigrateLegacyConfig(LegacyConfigData{PrivateKey: privateKey})
+}

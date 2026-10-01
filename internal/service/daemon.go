@@ -59,9 +59,9 @@ func NewDaemon(port int, pipeName, configDir string) *Daemon {
 func (d *Daemon) Start() error {
 	log.Printf("[Daemon] Initializing service daemon in %s", d.configDir)
 
-	// 1. Secure configuration directory
+	// 1. Secure configuration directory (fail-closed if permissions cannot be enforced/verified)
 	if err := config.SetupDirectorySecurity(d.configDir); err != nil {
-		log.Printf("[Daemon] Warning securing config directory: %v", err)
+		return fmt.Errorf("failed to secure service configuration directory: %w", err)
 	}
 
 	// 2. Load or initialize machine-wide protected configuration
@@ -150,12 +150,27 @@ func (d *Daemon) Start() error {
 			}
 			return &ipc.SetPinResult{Success: true, Message: "Master PIN updated successfully"}, nil
 		},
-		MigrateLegacyKey: func(privateKey string) (*ipc.MigrateKeyResult, error) {
-			if err := d.cfg.MigrateKey(privateKey); err != nil {
+		MigrateLegacyKey: func(params ipc.MigrateKeyParams) (*ipc.MigrateKeyResult, error) {
+			devices := make(map[string]config.DeviceInfo)
+			for k, v := range params.AuthorizedDevices {
+				devices[k] = config.DeviceInfo{
+					Name:     v.Name,
+					AddedAt:  v.AddedAt,
+					LastSeen: v.LastSeen,
+				}
+			}
+			data := config.LegacyConfigData{
+				PrivateKey:        params.PrivateKey,
+				PinHash:           params.PinHash,
+				PinSalt:           params.PinSalt,
+				DeviceName:        params.DeviceName,
+				AuthorizedDevices: devices,
+			}
+			if err := d.cfg.MigrateLegacyConfig(data); err != nil {
 				return nil, fmt.Errorf("migration rejected: %w", err)
 			}
-			log.Println("[Daemon] Successfully imported and re-encrypted legacy keypair under service DPAPI")
-			return &ipc.MigrateKeyResult{Success: true, Message: "Keypair migrated successfully"}, nil
+			log.Println("[Daemon] Successfully imported, verified, and protected legacy configuration under service")
+			return &ipc.MigrateKeyResult{Success: true, Message: "Legacy configuration migrated successfully"}, nil
 		},
 		StopService: func() (*ipc.StopServiceResult, error) {
 			go func() {
@@ -166,7 +181,18 @@ func (d *Daemon) Start() error {
 		},
 	}
 
-	d.ipcServer = ipc.NewServer(d.pipeName, ipcHandlers)
+	// Determine the authorized Windows user SID for named pipe ACL and server identity validation
+	userSID := d.cfg.AuthorizedUserSID
+	if userSID == "" {
+		if consoleSID, err := ipc.GetActiveConsoleUserSID(); err == nil && consoleSID != "" {
+			userSID = consoleSID
+			d.cfg.AuthorizedUserSID = consoleSID
+			_ = d.cfg.Save()
+			log.Printf("[Daemon] Pinned authorized local user SID: %s", userSID)
+		}
+	}
+
+	d.ipcServer = ipc.NewServer(d.pipeName, ipcHandlers, userSID)
 
 	// 8. Launch listeners
 	go func() {

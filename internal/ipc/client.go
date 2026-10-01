@@ -182,13 +182,19 @@ func (c *Client) SetPin(oldPin, newPin string) (*SetPinResult, error) {
 	return &res, nil
 }
 
-// MigrateLegacyKey safely transfers an unencrypted private key over local IPC for service DPAPI protection
-func (c *Client) MigrateLegacyKey(privateKey string) (*MigrateKeyResult, error) {
+// MigrateLegacyKey safely transfers legacy configuration over local IPC for service DPAPI protection
+func (c *Client) MigrateLegacyKey(params interface{}) (*MigrateKeyResult, error) {
 	var res MigrateKeyResult
-	params := MigrateKeyParams{
-		PrivateKey: privateKey,
+	var p MigrateKeyParams
+	switch v := params.(type) {
+	case string:
+		p = MigrateKeyParams{PrivateKey: v}
+	case MigrateKeyParams:
+		p = v
+	default:
+		return nil, fmt.Errorf("invalid migration params type: %T", params)
 	}
-	if err := c.Call(MethodMigrateLegacyKey, params, &res); err != nil {
+	if err := c.Call(MethodMigrateLegacyKey, p, &res); err != nil {
 		return nil, err
 	}
 	return &res, nil
