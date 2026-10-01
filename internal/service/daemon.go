@@ -211,6 +211,10 @@ func (d *Daemon) Start() error {
 	}
 
 	log.Println("[Daemon] Service daemon running successfully")
+	go func() {
+		time.Sleep(1 * time.Second)
+		win32.TrimProcessMemory()
+	}()
 	return nil
 }
 

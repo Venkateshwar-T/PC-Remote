@@ -1,7 +1,7 @@
 {
   "name": "PC Remote",
   "short_name": "PCRemote",
-  "description": "Secure Decentralized Remote Management for Windows",
+  "description": "Secure Decentralized Remote Management for PC",
   "start_url": "./",
   "display": "standalone",
   "background_color": "#09090b",

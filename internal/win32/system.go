@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"os/exec"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -14,11 +16,24 @@ import (
 var (
 	modKernel32 = syscall.NewLazyDLL("kernel32.dll")
 
-	procGetSystemPowerStatus = modKernel32.NewProc("GetSystemPowerStatus")
-	procGlobalMemoryStatusEx = modKernel32.NewProc("GlobalMemoryStatusEx")
-	procGetTickCount64       = modKernel32.NewProc("GetTickCount64")
-	procGetSystemTimes       = modKernel32.NewProc("GetSystemTimes")
+	procGetSystemPowerStatus     = modKernel32.NewProc("GetSystemPowerStatus")
+	procGlobalMemoryStatusEx     = modKernel32.NewProc("GlobalMemoryStatusEx")
+	procGetTickCount64           = modKernel32.NewProc("GetTickCount64")
+	procGetSystemTimes           = modKernel32.NewProc("GetSystemTimes")
+	procSetProcessWorkingSetSize = modKernel32.NewProc("SetProcessWorkingSetSize")
+	procGetCurrentProcess         = modKernel32.NewProc("GetCurrentProcess")
 )
+
+// TrimProcessMemory forces garbage collection, releases OS memory pages,
+// and trims the process working set to minimize physical RAM consumption.
+func TrimProcessMemory() {
+	runtime.GC()
+	debug.FreeOSMemory()
+	hProc, _, _ := procGetCurrentProcess.Call()
+	if hProc != 0 {
+		procSetProcessWorkingSetSize.Call(hProc, ^uintptr(0), ^uintptr(0))
+	}
+}
 
 type SystemPowerStatus struct {
 	ACLineStatus        byte

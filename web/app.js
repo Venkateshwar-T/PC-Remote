@@ -22,6 +22,7 @@
   let lastTelemetryData = null;
   let pendingAction = null;
   let pollInterval = null;
+  let activeTransport = 'CONNECTED';
 
   // DOM Elements - Views
   const landingStateView = document.getElementById('landingStateView');
@@ -457,7 +458,7 @@
           <line x1="12" y1="17" x2="12" y2="21"/>
         </svg>`;
       landingTitle.textContent = 'No Device Paired';
-      landingDesc.textContent = 'Open this page from the pairing QR code displayed by PC Remote on your Windows PC.';
+      landingDesc.textContent = 'Open this page from the pairing QR code displayed by PC Remote on your PC.';
       landingBadge.style.display = 'none';
       btnLandingAction.style.display = 'none';
       setStatus('offline', 'IDLE');
@@ -470,7 +471,7 @@
           <line x1="12" y1="17" x2="12.01" y2="17"/>
         </svg>`;
       landingTitle.textContent = 'Invalid Pairing Link';
-      landingDesc.textContent = 'The pairing link is malformed or invalid. Generate a new pairing QR code from PC Remote on your Windows PC.';
+      landingDesc.textContent = 'The pairing link is malformed or invalid. Generate a new pairing QR code from PC Remote on your PC.';
       landingBadge.style.display = 'none';
       btnLandingAction.style.display = 'none';
       setStatus('offline', 'INVALID');
@@ -482,7 +483,7 @@
           <polyline points="12 6 12 12 16 14"/>
         </svg>`;
       landingTitle.textContent = 'Pairing Link Expired';
-      landingDesc.textContent = 'This pairing session has expired for your security. Generate a new pairing QR code from PC Remote on your Windows PC.';
+      landingDesc.textContent = 'This pairing session has expired for your security. Generate a new pairing QR code from PC Remote on your PC.';
       landingBadge.style.display = 'none';
       btnLandingAction.style.display = 'none';
       setStatus('offline', 'EXPIRED');
@@ -689,6 +690,7 @@
         isPcOnline = true;
         consecutiveFailures = 0;
         lastSeenTime = Date.now();
+        activeTransport = 'CONNECTED';
         setStatus('online', 'CONNECTED');
         resolve(data);
       }
@@ -768,7 +770,8 @@
                 isPcOnline = true;
                 consecutiveFailures = 0;
                 lastSeenTime = Date.now();
-                setStatus('online', 'LAN DIRECT');
+                activeTransport = 'LOCAL';
+                setStatus('online', 'LOCAL');
                 return data;
               }
             }
@@ -944,7 +947,7 @@
             consecutiveFailures = 0;
             isPcOnline = true;
             lastSeenTime = Date.now();
-            setStatus('online', config.lanHost ? 'LAN DIRECT' : 'CONNECTED');
+            setStatus('online', activeTransport || 'CONNECTED');
             updateTelemetryUI(tel);
           }
         }).catch(() => {
@@ -1049,7 +1052,7 @@
       btnLock.disabled = !isPcOnline;
       btnLock.classList.remove('is-locked');
       lockName.textContent = 'Lock';
-      lockDesc.textContent = 'Lock Windows immediately';
+      lockDesc.textContent = 'Lock PC immediately';
       lockRight.innerHTML = `
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <polyline points="9 18 15 12 9 6"/>
@@ -1069,7 +1072,7 @@
               consecutiveFailures = 0;
               isPcOnline = true;
               lastSeenTime = Date.now();
-              setStatus('online', config.lanHost ? 'LAN DIRECT' : 'CONNECTED');
+              setStatus('online', activeTransport || 'CONNECTED');
               updateTelemetryUI(tel);
             }
           })
@@ -1123,7 +1126,7 @@
             consecutiveFailures = 0;
             isPcOnline = true;
             lastSeenTime = Date.now();
-            setStatus('online', config.lanHost ? 'LAN DIRECT' : 'CONNECTED');
+            setStatus('online', activeTransport || 'CONNECTED');
             updateTelemetryUI(tel);
             showToast('PC is online');
           }
@@ -1153,7 +1156,7 @@
     openConfirm(
       'sleep',
       'Confirm Sleep',
-      'Windows will enter low-power sleep mode. You will need to press the PC power button or wake it up locally to resume.',
+      'The PC will enter low-power sleep mode. You will need to press the PC power button or wake it up locally to resume.',
       false
     );
   });
@@ -1166,7 +1169,7 @@
     openConfirm(
       'restart',
       'Confirm Restart',
-      'Windows will close running applications and reboot in 5 seconds. The connection will automatically restore once Windows starts back up.',
+      'The PC will close running applications and reboot in 5 seconds. The connection will automatically restore once the PC starts back up.',
       false
     );
   });
@@ -1179,7 +1182,7 @@
     openConfirm(
       'shutdown',
       'Confirm Shut Down',
-      'Windows will shut down completely in 5 seconds. You will need physical access to turn the PC on again.',
+      'The PC will shut down completely in 5 seconds. You will need physical access to turn the PC on again.',
       true
     );
   });
@@ -1213,7 +1216,7 @@
       stateIconWrap.className = 'state-icon-wrap is-sleeping';
       stateIconWrap.innerHTML = '<svg viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
       stateTitle.textContent = 'PC is in Sleep Mode';
-      stateDesc.textContent = 'Windows entered low-power standby mode. The remote connection has closed. Press the physical power button on the PC to wake it up.';
+      stateDesc.textContent = 'The PC entered low-power standby mode. The remote connection has closed. Press the physical power button on the PC to wake it up.';
       stateBadgeDot.className = 'state-badge-dot';
       stateBadgeText.textContent = 'STANDBY • DISCONNECTED';
       btnStateAction.textContent = 'Reconnect when awake';
@@ -1223,7 +1226,7 @@
       stateIconWrap.className = 'state-icon-wrap is-restarting';
       stateIconWrap.innerHTML = '<svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>';
       stateTitle.textContent = 'Restarting PC...';
-      stateDesc.textContent = 'Windows is rebooting. Connection will automatically restore once Windows starts back up.';
+      stateDesc.textContent = 'The PC is rebooting. Connection will automatically restore once the PC starts back up.';
       stateBadgeDot.className = 'state-badge-dot pulse';
       stateBadgeText.textContent = 'REBOOTING';
       btnStateAction.textContent = 'Auto-reconnecting...';
@@ -1234,7 +1237,7 @@
       stateIconWrap.className = 'state-icon-wrap is-off';
       stateIconWrap.innerHTML = '<svg viewBox="0 0 24 24"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>';
       stateTitle.textContent = 'PC is Powered Off';
-      stateDesc.textContent = 'Windows has powered down completely. Remote control is unavailable until the PC is turned on manually.';
+      stateDesc.textContent = 'The PC has powered down completely. Remote control is unavailable until the PC is turned on manually.';
       stateBadgeDot.className = 'state-badge-dot';
       stateBadgeText.textContent = 'POWERED OFF';
       btnStateAction.textContent = 'Check if turned on';

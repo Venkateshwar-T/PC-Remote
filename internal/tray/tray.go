@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"image/png"
 	"os"
-	"os/exec"
 	"runtime"
 	"sync"
 	"syscall"
@@ -13,6 +12,7 @@ import (
 
 	qrcode "github.com/skip2/go-qrcode"
 	"laptopcontrol/internal/ipc"
+	"laptopcontrol/internal/win32"
 )
 
 var (
@@ -97,6 +97,8 @@ const (
 	WM_RBUTTONUP       = 0x0205
 	WM_LBUTTONDBLCLK   = 0x0203
 	WM_PAINT           = 0x000F
+	WM_SYSCOMMAND      = 0x0112
+	SC_MINIMIZE        = 0xF020
 	WM_CLOSE           = 0x0010
 	WM_COMMAND         = 0x0111
 	WM_DESTROY         = 0x0002
@@ -116,7 +118,6 @@ const (
 	DT_WORDBREAK       = 0x00000010
 	ID_TRAY_SHOW_PAIR  = 2001
 	ID_TRAY_CHANGE_PIN = 2004
-	ID_TRAY_OPEN_DASH  = 2002
 	ID_TRAY_EXIT       = 2003
 )
 
@@ -246,17 +247,24 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 			globalManager.ShowPairingWindow()
 		case ID_TRAY_CHANGE_PIN:
 			go globalManager.PromptChangePin()
-		case ID_TRAY_OPEN_DASH:
-			exec.Command("rundll32", "url.dll,FileProtocolHandler", globalManager.GetCurrentPairingURL()).Start()
 		case ID_TRAY_EXIT:
 			globalManager.Close()
 		}
 		return 0
 
+	case WM_SYSCOMMAND:
+		if (wParam & 0xFFF0) == SC_MINIMIZE {
+			procShowWindow.Call(hwnd, SW_HIDE)
+			globalManager.isShown = false
+			go globalManager.TrimMemory()
+			return 0
+		}
+
 	case WM_CLOSE:
 		// Don't kill process on close; just hide to tray!
 		procShowWindow.Call(hwnd, SW_HIDE)
 		globalManager.isShown = false
+		go globalManager.TrimMemory()
 		return 0
 
 	case WM_PAINT:
@@ -402,7 +410,6 @@ func (m *Manager) showContextMenu() {
 
 	procAppendMenuW.Call(hMenu, MF_STRING, ID_TRAY_SHOW_PAIR, uintptr(unsafe.Pointer(stringToUTF16Ptr("Show Pairing QR Code"))))
 	procAppendMenuW.Call(hMenu, MF_STRING, ID_TRAY_CHANGE_PIN, uintptr(unsafe.Pointer(stringToUTF16Ptr("Change Master PIN..."))))
-	procAppendMenuW.Call(hMenu, MF_STRING, ID_TRAY_OPEN_DASH, uintptr(unsafe.Pointer(stringToUTF16Ptr("Open Web Dashboard"))))
 	procAppendMenuW.Call(hMenu, MF_SEPARATOR, 0, 0)
 	procAppendMenuW.Call(hMenu, MF_STRING, ID_TRAY_EXIT, uintptr(unsafe.Pointer(stringToUTF16Ptr("Exit PC Remote"))))
 
@@ -513,39 +520,39 @@ func (m *Manager) onPaint(hwnd uintptr) {
 
 	// 3. Draw QR Code using SetDIBitsToDevice (260x260) - mathematically centered
 	m.qrMu.RLock()
-	pixelsLen := len(m.qrPixels)
-	var qrCopy []byte
-	var qrW, qrH int
-	if pixelsLen > 0 {
-		qrCopy = make([]byte, pixelsLen)
-		copy(qrCopy, m.qrPixels)
-		qrW = m.qrWidth
-		qrH = m.qrHeight
+	if len(m.qrPixels) == 0 && m.pairingUrl != "" {
+		m.qrMu.RUnlock()
+		m.qrMu.Lock()
+		if len(m.qrPixels) == 0 {
+			m.prepareQrBitmapLocked()
+		}
+		m.qrMu.Unlock()
+		m.qrMu.RLock()
 	}
-	m.qrMu.RUnlock()
 
-	if len(qrCopy) > 0 {
+	if len(m.qrPixels) > 0 {
 		var bmi BITMAPINFO
 		bmi.Header.Size = uint32(unsafe.Sizeof(bmi.Header))
-		bmi.Header.Width = int32(qrW)
-		bmi.Header.Height = -int32(qrH) // Top-down
+		bmi.Header.Width = int32(m.qrWidth)
+		bmi.Header.Height = -int32(m.qrHeight) // Top-down
 		bmi.Header.Planes = 1
 		bmi.Header.BitCount = 32
 		bmi.Header.Compression = 0 // BI_RGB
 
-		qrX := (clientWidth - qrW) / 2
+		qrX := (clientWidth - m.qrWidth) / 2
 		qrY := 98
 
 		procSetDIBitsToDevice.Call(
 			hdc,
 			uintptr(qrX), uintptr(qrY),
-			uintptr(qrW), uintptr(qrH),
-			0, 0, 0, uintptr(qrH),
-			uintptr(unsafe.Pointer(&qrCopy[0])),
+			uintptr(m.qrWidth), uintptr(m.qrHeight),
+			0, 0, 0, uintptr(m.qrHeight),
+			uintptr(unsafe.Pointer(&m.qrPixels[0])),
 			uintptr(unsafe.Pointer(&bmi)),
 			0,
 		)
 	}
+	m.qrMu.RUnlock()
 
 	// 4. Draw Device Name & Status (Bold 18px, Emerald Green #22c55e) - mathematically centered
 	procSetTextColor.Call(hdc, 0x005ec522) // Emerald Green #22c55e
@@ -676,24 +683,22 @@ func (m *Manager) Run() {
 	procSendMessageW.Call(hwnd, WM_SETICON, ICON_BIG, hIconBig)
 	procSendMessageW.Call(hwnd, WM_SETICON, ICON_SMALL, hIconSm)
 
-	// Add Tray Icon
+	// Add Tray Icon silently without any notification card
 	m.nid.Size = uint32(unsafe.Sizeof(m.nid))
 	m.nid.Wnd = hwnd
 	m.nid.ID = 1
-	m.nid.Flags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_INFO
+	m.nid.Flags = NIF_MESSAGE | NIF_ICON | NIF_TIP
 	m.nid.CallbackMessage = WM_TRAYICON
 	m.nid.Icon = hIconSm
-	m.nid.BalloonIcon = hIconBig
-	m.nid.InfoFlags = NIIF_USER | NIIF_LARGE_ICON
 	copyUTF16String(m.nid.Tip[:], "PC Remote (Running)")
-	copyUTF16String(m.nid.InfoTitle[:], "PC Remote Active")
-	copyUTF16String(m.nid.Info[:], "Click the tray icon anytime to pair your phone.")
 
 	procShell_NotifyIconW.Call(NIM_ADD, uintptr(unsafe.Pointer(&m.nid)))
 
 	// Show pairing window on launch unless silent mode is requested
 	if !m.silent {
 		m.ShowPairingWindow()
+	} else {
+		go m.TrimMemory()
 	}
 
 	// Win32 Message Loop
@@ -722,6 +727,16 @@ func (m *Manager) Run() {
 	}
 }
 
+// TrimMemory releases cached pixel buffers and invokes win32.TrimProcessMemory
+// to minimize the process's physical memory footprint while idling in tray.
+func (m *Manager) TrimMemory() {
+	m.qrMu.Lock()
+	m.qrPixels = nil
+	m.qrMu.Unlock()
+
+	win32.TrimProcessMemory()
+}
+
 func (m *Manager) ShowNotification(title, msg string) {
 	if m.hwnd == 0 {
 		return
@@ -745,7 +760,7 @@ func (m *Manager) PromptChangePin() {
 	header := "Change Master PIN"
 	devName := m.deviceName
 	if devName == "" {
-		devName = "Windows PC"
+		devName = "PC"
 	}
 	desc := fmt.Sprintf("Enter a new 6-digit Master PIN for %s.\nYour phone remote will need this new PIN on its next connection.", devName)
 	saveBtn := "Confirm & Update"

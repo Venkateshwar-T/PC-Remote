@@ -6,6 +6,8 @@ console.log('========================================================');
 console.log('  Running PC Remote PWA State Machine & Security Suite');
 console.log('========================================================\n');
 
+let onWebSocketMessageSent = null;
+
 // Mock DOM & Browser Environment
 function createMockEnvironment(initialHash = '', initialStorage = {}) {
   const storage = { ...initialStorage };
@@ -13,16 +15,32 @@ function createMockEnvironment(initialHash = '', initialStorage = {}) {
   const fetchCalls = [];
 
   class MockWebSocket {
+    static get CONNECTING() { return 0; }
+    static get OPEN() { return 1; }
+    static get CLOSING() { return 2; }
+    static get CLOSED() { return 3; }
+
     constructor(url) {
       this.url = url;
       this.readyState = 0; // CONNECTING
+      this.sent = [];
       wsCreated.push(this);
       setTimeout(() => {
         this.readyState = 1; // OPEN
         if (this.onopen) this.onopen();
       }, 5);
     }
-    send(data) {}
+    send(data) {
+      this.sent.push(data);
+      if (onWebSocketMessageSent) {
+        onWebSocketMessageSent(this, data);
+      }
+    }
+    emitMessage(data) {
+      if (this.onmessage) {
+        this.onmessage({ data: typeof data === 'string' ? data : JSON.stringify(data) });
+      }
+    }
     close() {
       this.readyState = 3; // CLOSED
       if (this.onclose) this.onclose();
@@ -44,7 +62,16 @@ function createMockEnvironment(initialHash = '', initialStorage = {}) {
         textContent: '',
         innerHTML: '',
         disabled: false,
-        addEventListener() {}
+        listeners: {},
+        addEventListener(event, fn) {
+          if (!this.listeners[event]) this.listeners[event] = [];
+          this.listeners[event].push(fn);
+        },
+        click() {
+          if (this.listeners['click']) {
+            for (const fn of this.listeners['click']) fn();
+          }
+        }
       };
     }
     return elements[id];
@@ -429,8 +456,180 @@ async function main() {
     console.log('  -> PASS: Initial UI flash invariant verified; all top-level views start hidden.\n');
   }
 
+  // --- TEST L: Frontend Terminology & Hygiene Verification ---
+  console.log('Testing Case L: Frontend Terminology & Hygiene Verification...');
+  {
+    const html = fs.readFileSync('web/index.html', 'utf8');
+    const appJs = fs.readFileSync('web/app.js', 'utf8');
+    const manifest = fs.readFileSync('web/manifest.json', 'utf8');
+
+    // 1. Zero occurrences of 'LAN DIRECT'
+    assert.strictEqual(html.includes('LAN DIRECT'), false, 'web/index.html must not contain LAN DIRECT');
+    assert.strictEqual(appJs.includes('LAN DIRECT'), false, 'web/app.js must not contain LAN DIRECT');
+    assert.strictEqual(manifest.includes('LAN DIRECT'), false, 'web/manifest.json must not contain LAN DIRECT');
+
+    // 2. Zero instances of config.lanHost ? in app.js for transport inference
+    assert.strictEqual(/config\.lanHost\s*\?/.test(appJs), false, 'web/app.js must not infer transport from config.lanHost');
+
+    // 3. User-facing product copy: zero "Windows" in index.html and manifest.json
+    assert.strictEqual(/Windows/i.test(html), false, 'web/index.html must not contain user-facing "Windows"');
+    assert.strictEqual(/Windows/i.test(manifest), false, 'web/manifest.json must not contain user-facing "Windows"');
+
+    // 4. In app.js: only user-agent check is allowed to mention Windows
+    const appJsLines = appJs.split('\n');
+    const userFacingWindows = appJsLines.filter((line) => {
+      if (!line.includes('Windows')) return false;
+      // Allow userAgent detection: if (/Windows/i.test(ua)) return 'Windows Remote';
+      if (/navigator\.userAgent|\/Windows\/i\.test/i.test(line)) return false;
+      return true;
+    });
+    assert.strictEqual(
+      userFacingWindows.length,
+      0,
+      'web/app.js must have zero user-facing "Windows" copy. Found: ' + JSON.stringify(userFacingWindows)
+    );
+
+    console.log('  -> PASS: All user-facing Windows references cleaned, LAN DIRECT removed, no lanHost status guessing.\n');
+  }
+
+  // --- TEST M: Transport Status Label Transitions (LOCAL vs CONNECTED) ---
+  console.log('Testing Case M: Transport Status Label Transitions (LOCAL vs CONNECTED)...');
+  {
+    async function createTestVault(phonePrivkey, laptopPubkey, lanHost = '192.168.1.50:8765') {
+      const enc = new TextEncoder();
+      const saltBytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
+      const ivBytes = globalThis.crypto.getRandomValues(new Uint8Array(12));
+      const pinKey = await globalThis.crypto.subtle.importKey('raw', enc.encode('123456'), { name: 'PBKDF2' }, false, ['deriveKey']);
+      const aesKey = await globalThis.crypto.subtle.deriveKey(
+        { name: 'PBKDF2', salt: saltBytes, iterations: 100000, hash: 'SHA-256' },
+        pinKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
+      );
+      const ctBuffer = await globalThis.crypto.subtle.encrypt({ name: 'AES-GCM', iv: ivBytes }, aesKey, enc.encode(phonePrivkey));
+      const phonePubkey = NostrTools.getPublicKey(NostrTools.utils.hexToBytes(phonePrivkey));
+
+      return {
+        pcremote_vault_auth: JSON.stringify({
+          laptopPubkey: laptopPubkey,
+          phonePubkey: phonePubkey,
+          saltHex: Array.from(saltBytes).map(b => b.toString(16).padStart(2, '0')).join(''),
+          ivHex: Array.from(ivBytes).map(b => b.toString(16).padStart(2, '0')).join(''),
+          ciphertextHex: Array.from(new Uint8Array(ctBuffer)).map(b => b.toString(16).padStart(2, '0')).join(''),
+          deviceName: 'Test-PC',
+          lanHost: lanHost,
+          isPaired: true
+        })
+      };
+    }
+
+    const laptopSk = NostrTools.generateSecretKey();
+    const laptopPk = NostrTools.getPublicKey(laptopSk);
+    const phoneSk = NostrTools.generateSecretKey();
+    const phonePrivHex = Array.from(phoneSk).map(b => b.toString(16).padStart(2, '0')).join('');
+
+    // 1. Direct LAN Success -> LOCAL
+    {
+      const vaultLan = await createTestVault(phonePrivHex, laptopPk, '192.168.1.50:8765');
+      const envLan = await runInMock('', vaultLan);
+
+      envLan.mockWindow.fetch = async (url, opts) => {
+        assert(url.includes('192.168.1.50:8765/api/control'), 'Fetch must target LAN endpoint');
+        const reqEvt = JSON.parse(opts.body);
+        const convKey = NostrTools.nip44.v2.utils.getConversationKey(laptopSk, reqEvt.pubkey);
+        const reqPlain = NostrTools.nip44.v2.decrypt(reqEvt.content, convKey);
+        const reqData = JSON.parse(reqPlain);
+
+        const respPayload = JSON.stringify({
+          id: reqData.id,
+          status: 'ok',
+          telemetry: { cpu: 15, ram: 40, uptime: '3h', isLocked: false }
+        });
+        const respCipher = NostrTools.nip44.v2.encrypt(respPayload, convKey);
+        const respEvt = NostrTools.finalizeEvent({
+          kind: 4,
+          created_at: Math.floor(Date.now() / 1000),
+          tags: [['p', reqEvt.pubkey]],
+          content: respCipher
+        }, laptopSk);
+
+        return {
+          ok: true,
+          json: async () => respEvt
+        };
+      };
+
+      await envLan.mockWindow.__verifyPin('123456');
+      await new Promise(r => setTimeout(r, 50));
+      assert.strictEqual(envLan.elements.statusLabel.textContent, 'LOCAL', 'Direct LAN success MUST set status to LOCAL');
+      assert.strictEqual(envLan.elements.statusIndicator.className, 'status-indicator', 'Status indicator must be online');
+      console.log('  -> Subcase 1 PASS: Direct LAN success renders ● LOCAL.');
+    }
+
+    // 2. Relay Fallback Success (LAN host exists, LAN fails, Relay succeeds) -> CONNECTED
+    {
+      const vaultRelay = await createTestVault(phonePrivHex, laptopPk, '192.168.1.50:8765');
+      const envRelay = await runInMock('', vaultRelay);
+      // Wait for MockWebSockets to transition to OPEN
+      await new Promise(r => setTimeout(r, 20));
+
+      // LAN fetch fails (offline LAN / mobile data)
+      envRelay.mockWindow.fetch = async () => {
+        throw new Error('Failed to connect to LAN endpoint (Offline/Different Network)');
+      };
+
+      // Nostr relay WebSocket responds to signed event
+      onWebSocketMessageSent = (sock, rawData) => {
+        try {
+          const msg = JSON.parse(rawData);
+          if (Array.isArray(msg) && msg[0] === 'EVENT') {
+            const reqEvt = msg[1];
+            if (reqEvt && reqEvt.kind === 4) {
+              const convKey = NostrTools.nip44.v2.utils.getConversationKey(laptopSk, reqEvt.pubkey);
+              const reqPlain = NostrTools.nip44.v2.decrypt(reqEvt.content, convKey);
+              const reqData = JSON.parse(reqPlain);
+
+              const respPayload = JSON.stringify({
+                id: reqData.id,
+                status: 'ok',
+                telemetry: { cpu: 22, ram: 55, uptime: '5h', isLocked: false }
+              });
+              const respCipher = NostrTools.nip44.v2.encrypt(respPayload, convKey);
+              const respEvt = NostrTools.finalizeEvent({
+                kind: 4,
+                created_at: Math.floor(Date.now() / 1000),
+                tags: [['p', reqEvt.pubkey]],
+                content: respCipher
+              }, laptopSk);
+
+              // Deliver via WebSocket subscription asynchronously (simulating relay latency)
+              setTimeout(() => {
+                sock.emitMessage(['EVENT', 'sub_cmd', respEvt]);
+              }, 5);
+            }
+          }
+        } catch (e) {}
+      };
+
+      await envRelay.mockWindow.__verifyPin('123456');
+      await new Promise(r => setTimeout(r, 80));
+      assert.strictEqual(envRelay.elements.statusLabel.textContent, 'CONNECTED', 'Relay fallback MUST set status to CONNECTED');
+      assert.notStrictEqual(envRelay.elements.statusLabel.textContent, 'LOCAL', 'MUST NOT show LOCAL when LAN failed, even if lanHost exists');
+      assert.strictEqual(envRelay.elements.statusIndicator.className, 'status-indicator', 'Status indicator must be online');
+      console.log('  -> Subcase 2 PASS: Stored lanHost with failing LAN correctly falls back to ● CONNECTED.');
+
+      // 3. Telemetry refresh must retain CONNECTED transport label
+      envRelay.elements.btnRefresh.click();
+      await new Promise(r => setTimeout(r, 80));
+      assert.strictEqual(envRelay.elements.statusLabel.textContent, 'CONNECTED', 'Subsequent refresh must keep CONNECTED transport label');
+      console.log('  -> Subcase 3 PASS: Refresh retains CONNECTED transport label without overwriting.');
+
+      onWebSocketMessageSent = null;
+    }
+
+    console.log('  -> PASS: Transport status accurately represents actual transport path in all conditions.\n');
+  }
+
   console.log('========================================================');
-  console.log('  ALL PWA STATE MACHINE & SECURITY TESTS PASSED (11/11)');
+  console.log('  ALL PWA STATE MACHINE & SECURITY TESTS PASSED (13/13)');
   console.log('========================================================\n');
 }
 
