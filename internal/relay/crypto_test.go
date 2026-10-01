@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip04"
 	"github.com/nbd-wtf/go-nostr/nip44"
 )
 
@@ -49,39 +48,6 @@ func TestCrypto_NIP44RoundTrip(t *testing.T) {
 	}
 }
 
-func TestCrypto_NIP04RoundTrip(t *testing.T) {
-	laptopSK := nostr.GeneratePrivateKey()
-	laptopPK, _ := nostr.GetPublicKey(laptopSK)
-
-	phoneSK := nostr.GeneratePrivateKey()
-	phonePK, _ := nostr.GetPublicKey(phoneSK)
-
-	phoneSecret, err := nip04.ComputeSharedSecret(laptopPK, phoneSK)
-	if err != nil {
-		t.Fatalf("ComputeSharedSecret failed: %v", err)
-	}
-
-	plaintext := `{"action":"lock","id":"req-456"}`
-	ciphertext, err := nip04.Encrypt(plaintext, phoneSecret)
-	if err != nil {
-		t.Fatalf("NIP04 Encrypt failed: %v", err)
-	}
-
-	laptopSecret, err := nip04.ComputeSharedSecret(phonePK, laptopSK)
-	if err != nil {
-		t.Fatalf("Laptop ComputeSharedSecret failed: %v", err)
-	}
-
-	decrypted, err := nip04.Decrypt(ciphertext, laptopSecret)
-	if err != nil {
-		t.Fatalf("NIP04 Decrypt failed: %v", err)
-	}
-
-	if decrypted != plaintext {
-		t.Fatalf("Decrypted mismatch! Got %s, expected %s", decrypted, plaintext)
-	}
-}
-
 func TestCrypto_EventSignature(t *testing.T) {
 	sk := nostr.GeneratePrivateKey()
 	pk, _ := nostr.GetPublicKey(sk)
@@ -103,7 +69,7 @@ func TestCrypto_EventSignature(t *testing.T) {
 		t.Fatalf("Signature verification failed: %v", err)
 	}
 
-	// Tampering test
+	// Tampering test: modified content must invalidate signature
 	evt.Content = "tampered-content"
 	valid, _ = evt.CheckSignature()
 	if valid {

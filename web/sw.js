@@ -1,4 +1,4 @@
-const CACHE_NAME = 'pcremote-v5';
+const CACHE_NAME = 'pcremote-v6';
 const ASSETS = [
   './',
   './index.html',
@@ -29,11 +29,15 @@ self.addEventListener('activate', (event) => {
 });
 
 self.addEventListener('fetch', (event) => {
+  // Never cache non-GET or API endpoints
   if (event.request.method !== 'GET') return;
+  const url = new URL(event.request.url);
+  if (url.pathname.startsWith('/api/')) return;
+
   event.respondWith(
     caches.match(event.request).then((cached) => {
       if (cached) {
-        // Return cached immediately and refresh in background if online
+        // Return cached shell immediately and refresh in background
         fetch(event.request).then((networkResponse) => {
           if (networkResponse && networkResponse.status === 200) {
             caches.open(CACHE_NAME).then((cache) => cache.put(event.request, networkResponse));

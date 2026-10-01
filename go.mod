@@ -5,6 +5,7 @@ go 1.24.1
 require (
 	github.com/nbd-wtf/go-nostr v0.52.3
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
+	golang.org/x/sys v0.31.0
 )
 
 require (
@@ -31,5 +32,4 @@ require (
 	golang.org/x/arch v0.15.0 // indirect
 	golang.org/x/crypto v0.36.0 // indirect
 	golang.org/x/exp v0.0.0-20250305212735-054e65f0b394 // indirect
-	golang.org/x/sys v0.31.0 // indirect
 )

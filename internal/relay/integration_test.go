@@ -9,6 +9,8 @@ import (
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip44"
 	"laptopcontrol/internal/config"
+	"laptopcontrol/internal/pairing"
+	"laptopcontrol/internal/protocol"
 )
 
 func TestNostrFlow_PairingAndAuthorizedCommands(t *testing.T) {
@@ -24,10 +26,12 @@ func TestNostrFlow_PairingAndAuthorizedCommands(t *testing.T) {
 	}
 	_ = cfg.SetPin("123456")
 
-	activePairingToken := "test-pairing-token-abc"
-	client := NewClient(cfg, nil, func() string {
-		return activePairingToken
-	})
+	pairMgr := pairing.NewManager()
+	replayGuard := protocol.NewReplayGuard(120)
+	handler := protocol.NewHandler(cfg, pairMgr, replayGuard)
+	client := NewClient(cfg, nil, handler)
+
+	activePairingToken := pairMgr.GetToken()
 
 	// Phone generates its own keypair
 	phoneSK := nostr.GeneratePrivateKey()
@@ -39,7 +43,7 @@ func TestNostrFlow_PairingAndAuthorizedCommands(t *testing.T) {
 	}
 
 	// 1. Attempt command BEFORE pairing -> Must fail authorization
-	unauthCmd := Packet{
+	unauthCmd := protocol.CommandPacket{
 		ID:        "cmd-unauth-1",
 		Action:    "telemetry",
 		Timestamp: time.Now().Unix(),
@@ -56,14 +60,13 @@ func TestNostrFlow_PairingAndAuthorizedCommands(t *testing.T) {
 	}
 	_ = unauthEvt.Sign(phoneSK)
 
-	// Call handleEvent
-	client.handleEvent(unauthEvt)
+	client.HandleEvent(unauthEvt)
 	if cfg.IsDeviceAuthorized(phonePK) {
 		t.Fatal("Device must NOT be authorized before pairing")
 	}
 
 	// 2. Perform Pairing with WRONG PIN -> Must fail
-	badPairCmd := Packet{
+	badPairCmd := protocol.CommandPacket{
 		ID:         "cmd-pair-bad",
 		Action:     "pair",
 		Token:      activePairingToken,
@@ -83,13 +86,13 @@ func TestNostrFlow_PairingAndAuthorizedCommands(t *testing.T) {
 	}
 	_ = badPairEvt.Sign(phoneSK)
 
-	client.handleEvent(badPairEvt)
+	client.HandleEvent(badPairEvt)
 	if cfg.IsDeviceAuthorized(phonePK) {
 		t.Fatal("Device must NOT be authorized with wrong PIN")
 	}
 
 	// 3. Perform Pairing with VALID PIN & TOKEN -> Must succeed
-	goodPairCmd := Packet{
+	goodPairCmd := protocol.CommandPacket{
 		ID:         "cmd-pair-good",
 		Action:     "pair",
 		Token:      activePairingToken,
@@ -109,32 +112,31 @@ func TestNostrFlow_PairingAndAuthorizedCommands(t *testing.T) {
 	}
 	_ = goodPairEvt.Sign(phoneSK)
 
-	client.handleEvent(goodPairEvt)
+	client.HandleEvent(goodPairEvt)
 	if !cfg.IsDeviceAuthorized(phonePK) {
-		t.Fatal("Device MUST be authorized after valid pairing")
+		t.Fatal("Device must be authorized after successful pairing handshake")
 	}
 
-	// 4. Send authorized command WITHOUT any PIN -> Must succeed
-	telemetryCmd := Packet{
-		ID:        "cmd-telemetry-1",
+	// 4. Send Authorized Command after Pairing -> Must succeed
+	authCmd := protocol.CommandPacket{
+		ID:        "cmd-auth-telemetry",
 		Action:    "telemetry",
 		Timestamp: time.Now().Unix(),
 	}
-	telemetryJSON, _ := json.Marshal(telemetryCmd)
-	telemetryCT, _ := nip44.Encrypt(string(telemetryJSON), convKey)
+	authJSON, _ := json.Marshal(authCmd)
+	authCT, _ := nip44.Encrypt(string(authJSON), convKey)
 
-	telemetryEvt := &nostr.Event{
+	authEvt := &nostr.Event{
 		PubKey:    phonePK,
 		CreatedAt: nostr.Now(),
 		Kind:      4,
 		Tags:      nostr.Tags{{"p", cfg.LaptopPubKey}},
-		Content:   telemetryCT,
+		Content:   authCT,
 	}
-	_ = telemetryEvt.Sign(phoneSK)
+	_ = authEvt.Sign(phoneSK)
 
-	client.handleEvent(telemetryEvt)
+	client.HandleEvent(authEvt)
 
-	// 5. Test Replay of the SAME command -> ReplayGuard must reject it
-	client.handleEvent(telemetryEvt)
-	// (Replay is tested via ReplayGuard ValidateAndRecord returning false)
+	// 5. Test Replay of Authorized Command -> Must be dropped by ReplayGuard
+	client.HandleEvent(authEvt)
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -66,16 +67,30 @@ type DeviceInfo struct {
 }
 
 type Config struct {
-	mu                sync.RWMutex
-	filePath          string
-	PinHash           string                `json:"pinHash"`
-	PinSalt           string                `json:"pinSalt"`
-	DeviceName        string                `json:"deviceName"`
-	LaptopPrivKey     string                `json:"laptopPrivKey"`
-	LaptopPubKey      string                `json:"laptopPubKey"`
-	AuthorizedDevices map[string]DeviceInfo `json:"authorizedDevices"`
-	FailedAttempts    int                   `json:"failedAttempts"`
-	LockoutUntil      time.Time             `json:"lockoutUntil"`
+	mu                 sync.RWMutex
+	filePath           string
+	PinHash            string                `json:"pinHash"`
+	PinSalt            string                `json:"pinSalt"`
+	DeviceName         string                `json:"deviceName"`
+	LaptopPrivKeyDPAPI string                `json:"laptopPrivKeyEncrypted,omitempty"`
+	LaptopPrivKey      string                `json:"-"` // Stored in-memory only; NEVER written as plaintext to disk
+	LaptopPubKey       string                `json:"laptopPubKey"`
+	AuthorizedDevices  map[string]DeviceInfo `json:"authorizedDevices"`
+	FailedAttempts     int                   `json:"failedAttempts"`
+	LockoutUntil       time.Time             `json:"lockoutUntil"`
+}
+
+// diskRepresentation is used exclusively during unmarshaling to handle migration from legacy plaintext keys
+type diskRepresentation struct {
+	PinHash            string                `json:"pinHash"`
+	PinSalt            string                `json:"pinSalt"`
+	DeviceName         string                `json:"deviceName"`
+	LaptopPrivKey      string                `json:"laptopPrivKey,omitempty"` // Legacy plaintext field
+	LaptopPrivKeyDPAPI string                `json:"laptopPrivKeyEncrypted,omitempty"`
+	LaptopPubKey       string                `json:"laptopPubKey"`
+	AuthorizedDevices  map[string]DeviceInfo `json:"authorizedDevices"`
+	FailedAttempts     int                   `json:"failedAttempts"`
+	LockoutUntil       time.Time             `json:"lockoutUntil"`
 }
 
 // LoadOrCreate loads existing config or creates a new one
@@ -88,24 +103,65 @@ func LoadOrCreate(baseDir string) (*Config, error) {
 
 	data, err := os.ReadFile(cfgFile)
 	if err == nil {
-		if err := json.Unmarshal(data, cfg); err == nil {
+		var disk diskRepresentation
+		if err := json.Unmarshal(data, &disk); err == nil {
+			cfg.PinHash = disk.PinHash
+			cfg.PinSalt = disk.PinSalt
+			cfg.DeviceName = disk.DeviceName
+			cfg.LaptopPubKey = disk.LaptopPubKey
+			cfg.AuthorizedDevices = disk.AuthorizedDevices
+			cfg.FailedAttempts = disk.FailedAttempts
+			cfg.LockoutUntil = disk.LockoutUntil
+			cfg.LaptopPrivKeyDPAPI = disk.LaptopPrivKeyDPAPI
+
 			if cfg.AuthorizedDevices == nil {
 				cfg.AuthorizedDevices = make(map[string]DeviceInfo)
 			}
-			// Verify cryptographic keypair validity
-			validKeys := false
+
+			needsSave := false
+
+			// 1. Decrypt DPAPI key if available
+			if disk.LaptopPrivKeyDPAPI != "" {
+				cipherBytes, errB64 := base64.StdEncoding.DecodeString(disk.LaptopPrivKeyDPAPI)
+				if errB64 == nil {
+					plainBytes, errDec := DecryptDPAPI(cipherBytes)
+					if errDec == nil && len(plainBytes) > 0 {
+						cfg.LaptopPrivKey = string(plainBytes)
+					}
+				}
+			}
+
+			// 2. Migration: If DPAPI was not present or failed, check for legacy plaintext key
+			if cfg.LaptopPrivKey == "" && disk.LaptopPrivKey != "" {
+				cfg.LaptopPrivKey = disk.LaptopPrivKey
+				// Immediately encrypt with DPAPI and mark for disk rewrite
+				encBytes, errEnc := EncryptDPAPI([]byte(disk.LaptopPrivKey))
+				if errEnc == nil && len(encBytes) > 0 {
+					cfg.LaptopPrivKeyDPAPI = base64.StdEncoding.EncodeToString(encBytes)
+				}
+				needsSave = true
+			}
+
+			// 3. Verify cryptographic keypair validity
 			if cfg.LaptopPrivKey != "" {
 				derivedPub, err := nostr.GetPublicKey(cfg.LaptopPrivKey)
 				if err == nil && derivedPub != "" {
 					if cfg.LaptopPubKey != derivedPub {
 						cfg.LaptopPubKey = derivedPub
+						needsSave = true
+					}
+					if cfg.LaptopPrivKeyDPAPI == "" {
+						encBytes, errEnc := EncryptDPAPI([]byte(cfg.LaptopPrivKey))
+						if errEnc == nil {
+							cfg.LaptopPrivKeyDPAPI = base64.StdEncoding.EncodeToString(encBytes)
+							needsSave = true
+						}
+					}
+					if needsSave {
 						_ = cfg.Save()
 					}
-					validKeys = true
+					return cfg, nil
 				}
-			}
-			if validKeys {
-				return cfg, nil
 			}
 		}
 	}
@@ -125,6 +181,12 @@ func LoadOrCreate(baseDir string) (*Config, error) {
 	}
 	cfg.LaptopPrivKey = privKey
 	cfg.LaptopPubKey = pubKey
+
+	// Protect private key with Windows DPAPI
+	encBytes, errEnc := EncryptDPAPI([]byte(privKey))
+	if errEnc == nil {
+		cfg.LaptopPrivKeyDPAPI = base64.StdEncoding.EncodeToString(encBytes)
+	}
 
 	if err := cfg.Save(); err != nil {
 		return nil, err
@@ -233,15 +295,6 @@ func (c *Config) RevokeDevice(pubKey string) error {
 	return nil
 }
 
-// RevokeAllDevices unpairs all registered devices
-func (c *Config) RevokeAllDevices() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.AuthorizedDevices = make(map[string]DeviceInfo)
-	return c.saveLocked()
-}
-
 // UpdateDeviceLastSeen refreshes the last active timestamp for an authorized device
 func (c *Config) UpdateDeviceLastSeen(pubKey string) {
 	c.mu.Lock()
@@ -264,18 +317,6 @@ func (c *Config) IsDeviceAuthorized(pubKey string) bool {
 	}
 	_, ok := c.AuthorizedDevices[pubKey]
 	return ok
-}
-
-// GetAuthorizedDevices returns a snapshot copy of authorized devices
-func (c *Config) GetAuthorizedDevices() map[string]DeviceInfo {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	res := make(map[string]DeviceInfo, len(c.AuthorizedDevices))
-	for k, v := range c.AuthorizedDevices {
-		res[k] = v
-	}
-	return res
 }
 
 // Save persists config to file

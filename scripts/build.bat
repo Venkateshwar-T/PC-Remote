@@ -14,9 +14,8 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-echo [1/3] Downloading dependencies...
-go get github.com/gorilla/websocket
-go get github.com/skip2/go-qrcode
+echo [1/3] Syncing dependencies...
+go mod download
 go mod tidy
 
 REM Generate Windows PE icon resources if icon.png exists

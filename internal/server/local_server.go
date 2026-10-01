@@ -1,56 +1,39 @@
 package server
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 
+	"github.com/nbd-wtf/go-nostr"
 	"laptopcontrol/internal/config"
+	"laptopcontrol/internal/pairing"
+	"laptopcontrol/internal/protocol"
 	"laptopcontrol/internal/qr"
-	"laptopcontrol/internal/win32"
 )
 
 type Server struct {
-	cfg          *config.Config
-	webFS        fs.FS
-	port         int
-	pairingToken string
-	pairingExp   time.Time
-	mu           sync.RWMutex
+	cfg        *config.Config
+	webFS      fs.FS
+	port       int
+	pairingMgr *pairing.Manager
+	handler    *protocol.Handler
+	mu         sync.RWMutex
 }
 
-func NewServer(cfg *config.Config, webFS fs.FS, port int) *Server {
-	s := &Server{
-		cfg:   cfg,
-		webFS: webFS,
-		port:  port,
+func NewServer(cfg *config.Config, webFS fs.FS, port int, pairingMgr *pairing.Manager, handler *protocol.Handler) *Server {
+	return &Server{
+		cfg:        cfg,
+		webFS:      webFS,
+		port:       port,
+		pairingMgr: pairingMgr,
+		handler:    handler,
 	}
-	s.RegeneratePairingToken()
-	return s
-}
-
-func (s *Server) RegeneratePairingToken() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	b := make([]byte, 16)
-	rand.Read(b)
-	s.pairingToken = hex.EncodeToString(b)
-	s.pairingExp = time.Now().Add(5 * time.Minute)
-	return s.pairingToken
-}
-
-func (s *Server) GetPairingToken() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.pairingToken
 }
 
 // GetLocalIPv4 returns the preferred outbound LAN IPv4 address
@@ -80,26 +63,12 @@ const DefaultCloudflareURL = "https://pc-remote-45t.pages.dev"
 // GetPairingURL generates the complete pairing URL pointing to your Cloudflare Pages PWA
 func (s *Server) GetPairingURL() string {
 	ip := GetLocalIPv4()
-	token := s.GetPairingToken()
+	token := ""
+	if s.pairingMgr != nil {
+		token = s.pairingMgr.GetToken()
+	}
 	return fmt.Sprintf("%s/#pair=%s&key=%s&lan=%s:%d&name=%s",
 		DefaultCloudflareURL, token, s.cfg.LaptopPubKey, ip, s.port, s.cfg.DeviceName)
-}
-
-// GetLocalPairingURL returns the direct local IP pairing URL
-func (s *Server) GetLocalPairingURL() string {
-	ip := GetLocalIPv4()
-	token := s.GetPairingToken()
-	return fmt.Sprintf("http://%s:%d/#pair=%s&key=%s&lan=%s:%d&name=%s",
-		ip, s.port, token, s.cfg.LaptopPubKey, ip, s.port, s.cfg.DeviceName)
-}
-
-type ControlRequest struct {
-	Action      string `json:"action"`
-	Pin         string `json:"pin"`
-	NewPin      string `json:"new_pin,omitempty"`
-	Token       string `json:"token"`
-	PhonePubKey string `json:"phonePubKey,omitempty"`
-	Timestamp   int64  `json:"timestamp"`
 }
 
 func isAllowedOrigin(origin string) bool {
@@ -148,19 +117,26 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	path := r.URL.Path
 
-	// Control API
-	if path == "/api/control" && r.Method == http.MethodPost {
+	// Control API: strict POST only
+	if path == "/api/control" {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		s.handleControl(w, r)
 		return
 	}
 
-	// Status API
+	// Status API: sanitized minimal status (zero sensitive disclosures)
 	if path == "/api/status" {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":     "running",
 			"deviceName": s.cfg.DeviceName,
-			"localIp":    GetLocalIPv4(),
 		})
 		return
 	}
@@ -214,78 +190,41 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 	// Security: Limit request body to 64KB to prevent DoS memory exhaustion
 	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
 
-	var req ControlRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request payload"})
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to read request body"})
 		return
 	}
 
-	// Handle pairing action
-	if req.Action == "pair" {
-		if req.Token == "" || req.Token != s.GetPairingToken() {
-			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid or expired pairing token. Scan QR code again."})
+	// Require cryptographic Nostr envelope format
+	var evt nostr.Event
+	if err := json.Unmarshal(bodyBytes, &evt); err == nil && evt.Sig != "" && evt.Content != "" && evt.PubKey != "" {
+		// Valid cryptographic envelope structure! Process through the unified security pipeline
+		if s.handler == nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Protocol handler uninitialized"})
 			return
 		}
-		ok, errMsg := s.cfg.VerifyPin(req.Pin)
-		if !ok {
+
+		respEvt, errProc := s.handler.ProcessCommandEvent(&evt)
+		if errProc != nil {
 			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(map[string]string{"error": errMsg})
+			json.NewEncoder(w).Encode(map[string]string{"error": errProc.Error()})
 			return
 		}
-		if req.PhonePubKey != "" {
-			_ = s.cfg.AuthorizeDevice(req.PhonePubKey, "Direct LAN Phone")
-		}
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":     "ok",
-			"message":    "Device paired successfully",
-			"deviceName": s.cfg.DeviceName,
-			"telemetry":  win32.QueryTelemetry(s.cfg.DeviceName),
-		})
+
+		// Return the signed, NIP-44 encrypted response Nostr event
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(respEvt)
 		return
 	}
 
-	// Validate PIN for direct LAN control
-	ok, errMsg := s.cfg.VerifyPin(req.Pin)
-	if !ok {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{"error": errMsg})
-		return
-	}
-
-	switch req.Action {
-	case "telemetry":
-		data := win32.QueryTelemetry(s.cfg.DeviceName)
-		json.NewEncoder(w).Encode(data)
-
-	case "lock":
-		win32.LockScreen()
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "Workstation locked"})
-
-	case "sleep":
-		win32.SuspendSystem()
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "Entering sleep mode"})
-
-	case "restart":
-		win32.RebootSystem()
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "Restart initiated"})
-
-	case "shutdown":
-		win32.PowerOffSystem()
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "Shutdown initiated"})
-
-	case "change_pin":
-		w.WriteHeader(http.StatusForbidden)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error": "For security, Master PIN can only be changed directly on the PC desktop.",
-		})
-		return
-
-	default:
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Unknown action"})
-	}
+	// Strictly reject legacy unencrypted or plaintext PIN requests
+	w.WriteHeader(http.StatusUnauthorized)
+	json.NewEncoder(w).Encode(map[string]string{
+		"error": "Plaintext commands rejected. PC Remote requires cryptographically signed & encrypted Nostr envelope.",
+	})
 }
 
 func (s *Server) handlePairingPage(w http.ResponseWriter, r *http.Request) {
@@ -298,42 +237,60 @@ func (s *Server) handlePairingPage(w http.ResponseWriter, r *http.Request) {
   <meta charset="utf-8">
   <title>PC Remote - Pair Phone</title>
   <style>
-    body { background: #09090b; color: #f4f4f5; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
-    .card { background: #141417; border: 1px solid #27272a; border-radius: 14px; padding: 32px; max-width: 380px; text-align: center; }
-    h2 { margin: 0 0 8px 0; font-size: 20px; }
-    p { color: #a1a1aa; font-size: 13px; line-height: 1.5; margin: 0 0 20px 0; }
-    .qr-box { background: #ffffff; padding: 16px; border-radius: 12px; display: inline-block; margin-bottom: 20px; }
-    .qr-box img { display: block; width: 220px; height: 220px; }
-    .status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-family: monospace; background: rgba(34,197,94,0.1); color: #22c55e; border: 1px solid rgba(34,197,94,0.25); padding: 5px 12px; border-radius: 6px; }
-    .dot { width: 6px; height: 6px; border-radius: 50%%; background: #22c55e; }
+    body {
+      background: #09090b;
+      color: #fafafa;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+      padding: 20px;
+    }
+    .card {
+      background: #18181b;
+      border: 1px solid #27272a;
+      border-radius: 16px;
+      padding: 32px;
+      text-align: center;
+      max-width: 360px;
+      width: 100%%;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    }
+    h1 { font-size: 20px; font-weight: 600; margin: 0 0 8px 0; }
+    p { color: #a1a1aa; font-size: 14px; margin: 0 0 24px 0; }
+    .qr-wrap {
+      background: white;
+      padding: 16px;
+      border-radius: 12px;
+      display: inline-block;
+      margin-bottom: 20px;
+    }
+    .qr-wrap img { display: block; width: 220px; height: 220px; }
+    .device-name {
+      font-size: 13px;
+      color: #71717a;
+      background: #27272a;
+      padding: 6px 12px;
+      border-radius: 20px;
+      display: inline-block;
+    }
   </style>
 </head>
 <body>
   <div class="card">
-    <h2>Pair Your Phone</h2>
-    <p>Point your phone's camera at the QR code below while connected to this Wi-Fi network.</p>
-    <div class="qr-box">
+    <h1>Pair with Phone</h1>
+    <p>Scan with your phone camera to pair securely</p>
+    <div class="qr-wrap">
       <img src="%s" alt="Pairing QR Code">
     </div>
-    <div>
-      <div class="status"><span class="dot"></span>Ready for pairing</div>
-    </div>
+    <div class="device-name">%s</div>
   </div>
 </body>
-</html>`, qrDataUri)
+</html>`, qrDataUri, s.cfg.DeviceName)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(html))
-}
-
-func isNumericPin(s string) bool {
-	if len(s) != 6 {
-		return false
-	}
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
 }

@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
-	"runtime/debug"
 	"syscall"
 	"unsafe"
 
@@ -27,7 +26,6 @@ var (
 	procRegisterClassExW      = modUser32.NewProc("RegisterClassExW")
 	procCreateWindowExW       = modUser32.NewProc("CreateWindowExW")
 	procDefWindowProcW        = modUser32.NewProc("DefWindowProcW")
-	procDestroyWindow         = modUser32.NewProc("DestroyWindow")
 	procShowWindow            = modUser32.NewProc("ShowWindow")
 	procUpdateWindow          = modUser32.NewProc("UpdateWindow")
 	procGetMessageW           = modUser32.NewProc("GetMessageW")
@@ -39,7 +37,6 @@ var (
 	procMessageBoxW           = modUser32.NewProc("MessageBoxW")
 	procLoadCursorW           = modUser32.NewProc("LoadCursorW")
 	procLoadIconW             = modUser32.NewProc("LoadIconW")
-	procLoadImageW            = modUser32.NewProc("LoadImageW")
 	procCreatePopupMenu       = modUser32.NewProc("CreatePopupMenu")
 	procAppendMenuW           = modUser32.NewProc("AppendMenuW")
 	procTrackPopupMenu        = modUser32.NewProc("TrackPopupMenu")
@@ -74,60 +71,51 @@ var (
 )
 
 const (
-	IMAGE_ICON          = 1
-	LR_DEFAULTCOLOR     = 0x0000
-	WM_SETICON          = 0x0080
-	ICON_SMALL          = 0
-	ICON_BIG            = 1
-	WM_APP              = 0x8000
-	WM_TRAYICON         = WM_APP + 1
-	WM_USER_SHOW_PAIR   = WM_APP + 2
-	NIM_ADD             = 0x00000000
-	NIM_MODIFY          = 0x00000001
-	NIM_DELETE          = 0x00000002
-	NIF_MESSAGE         = 0x00000001
-	NIF_ICON            = 0x00000002
-	NIF_TIP             = 0x00000004
-	NIF_INFO            = 0x00000010
-	NIIF_NONE           = 0x00000000
-	NIIF_INFO           = 0x00000001
-	NIIF_WARNING        = 0x00000002
-	NIIF_ERROR          = 0x00000003
-	NIIF_USER           = 0x00000004
-	NIIF_LARGE_ICON     = 0x00000020
-	ASFW_ANY            = 0xFFFFFFFF
-	HWND_TOPMOST        = ^uintptr(0)
-	HWND_NOTOPMOST      = ^uintptr(1)
-	SWP_NOMOVE          = 0x0002
-	SWP_NOSIZE          = 0x0001
-	SWP_SHOWWINDOW      = 0x0040
-	WM_LBUTTONUP        = 0x0202
-	WM_RBUTTONUP        = 0x0205
-	WM_LBUTTONDBLCLK    = 0x0203
-	WM_PAINT            = 0x000F
-	WM_CLOSE            = 0x0010
-	WM_COMMAND          = 0x0111
-	WM_DESTROY          = 0x0002
-	WS_OVERLAPPED       = 0x00000000
-	WS_CAPTION          = 0x00C00000
-	WS_SYSMENU          = 0x00080000
-	WS_MINIMIZEBOX      = 0x00020000
-	WS_POPUP            = 0x80000000
-	WS_VISIBLE          = 0x10000000
-	SW_HIDE             = 0
-	SW_SHOW             = 5
-	SW_RESTORE          = 9
-	MF_STRING           = 0x00000000
-	MF_SEPARATOR        = 0x00000800
-	TPM_RIGHTBUTTON     = 0x0002
-	TPM_BOTTOMALIGN     = 0x0020
-	DT_CENTER           = 0x00000001
-	DT_SINGLELINE       = 0x00000020
-	DT_WORDBREAK        = 0x00000010
-	ID_TRAY_SHOW_PAIR   = 2001
-	ID_TRAY_CHANGE_PIN  = 2004
-	ID_TRAY_OPEN_DASH   = 2002
-	ID_TRAY_EXIT        = 2003
+	WM_SETICON        = 0x0080
+	ICON_SMALL        = 0
+	ICON_BIG          = 1
+	WM_APP            = 0x8000
+	WM_TRAYICON       = WM_APP + 1
+	NIM_ADD           = 0x00000000
+	NIM_MODIFY        = 0x00000001
+	NIM_DELETE        = 0x00000002
+	NIF_MESSAGE       = 0x00000001
+	NIF_ICON          = 0x00000002
+	NIF_TIP           = 0x00000004
+	NIF_INFO          = 0x00000010
+	NIIF_USER         = 0x00000004
+	NIIF_LARGE_ICON   = 0x00000020
+	ASFW_ANY          = 0xFFFFFFFF
+	HWND_TOPMOST      = ^uintptr(0)
+	HWND_NOTOPMOST    = ^uintptr(1)
+	SWP_NOMOVE        = 0x0002
+	SWP_NOSIZE        = 0x0001
+	SWP_SHOWWINDOW    = 0x0040
+	WM_LBUTTONUP      = 0x0202
+	WM_RBUTTONUP      = 0x0205
+	WM_LBUTTONDBLCLK  = 0x0203
+	WM_PAINT          = 0x000F
+	WM_CLOSE          = 0x0010
+	WM_COMMAND        = 0x0111
+	WM_DESTROY        = 0x0002
+	WS_OVERLAPPED     = 0x00000000
+	WS_CAPTION        = 0x00C00000
+	WS_SYSMENU        = 0x00080000
+	WS_MINIMIZEBOX    = 0x00020000
+	SW_HIDE           = 0
+	SW_SHOW           = 5
+	SW_RESTORE        = 9
+	MF_STRING         = 0x00000000
+	MF_SEPARATOR      = 0x00000800
+	TPM_RIGHTBUTTON   = 0x0002
+	TPM_BOTTOMALIGN   = 0x0020
+	DT_CENTER         = 0x00000001
+	DT_SINGLELINE     = 0x00000020
+	DT_WORDBREAK      = 0x00000010
+	ID_TRAY_SHOW_PAIR = 2001
+	ID_TRAY_CHANGE_PIN = 2004
+	ID_TRAY_OPEN_DASH = 2002
+	ID_TRAY_EXIT      = 2003
 )
 
 type POINT struct {
@@ -324,9 +312,6 @@ func (m *Manager) prepareQrBitmap() {
 		}
 	}
 	m.qrPixels = pixels
-
-	// Release intermediate image decoder buffers immediately back to OS
-	debug.FreeOSMemory()
 }
 
 func (m *Manager) showContextMenu() {

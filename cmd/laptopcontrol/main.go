@@ -8,12 +8,13 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime/debug"
 	"syscall"
 	"time"
 	"unsafe"
 
 	"laptopcontrol/internal/config"
+	"laptopcontrol/internal/pairing"
+	"laptopcontrol/internal/protocol"
 	"laptopcontrol/internal/qr"
 	"laptopcontrol/internal/relay"
 	"laptopcontrol/internal/server"
@@ -26,33 +27,19 @@ var (
 	modUser32   = syscall.NewLazyDLL("user32.dll")
 	modShell32  = syscall.NewLazyDLL("shell32.dll")
 
-	procCreateMutexW      = modKernel32.NewProc("CreateMutexW")
-	procCloseHandle       = modKernel32.NewProc("CloseHandle")
-	procFindWindowW       = modUser32.NewProc("FindWindowW")
-	procSetForegroundWindow = modUser32.NewProc("SetForegroundWindow")
-	procShowWindow        = modUser32.NewProc("ShowWindow")
-	procPostMessageW      = modUser32.NewProc("PostMessageW")
-	procSetAppUserModelID = modShell32.NewProc("SetCurrentProcessExplicitAppUserModelID")
-	procSetWindowPos      = modUser32.NewProc("SetWindowPos")
-	procSwitchToThisWindow = modUser32.NewProc("SwitchToThisWindow")
+	procCreateMutexW             = modKernel32.NewProc("CreateMutexW")
+	procCloseHandle              = modKernel32.NewProc("CloseHandle")
+	procFindWindowW              = modUser32.NewProc("FindWindowW")
+	procSetForegroundWindow      = modUser32.NewProc("SetForegroundWindow")
+	procShowWindow               = modUser32.NewProc("ShowWindow")
+	procPostMessageW             = modUser32.NewProc("PostMessageW")
+	procSetAppUserModelID        = modShell32.NewProc("SetCurrentProcessExplicitAppUserModelID")
+	procSetWindowPos             = modUser32.NewProc("SetWindowPos")
+	procSwitchToThisWindow       = modUser32.NewProc("SwitchToThisWindow")
 	procAllowSetForegroundWindow = modUser32.NewProc("AllowSetForegroundWindow")
-	procGetCurrentProcess        = modKernel32.NewProc("GetCurrentProcess")
-	procSetProcessWorkingSetSize = modKernel32.NewProc("SetProcessWorkingSetSize")
 )
 
-func trimWorkingSet() {
-	debug.FreeOSMemory()
-	hProc, _, _ := procGetCurrentProcess.Call()
-	if hProc != 0 {
-		minusOne := ^uintptr(0)
-		procSetProcessWorkingSetSize.Call(hProc, minusOne, minusOne)
-	}
-}
-
 func main() {
-	// Memory optimization: instruct Go runtime to actively return idle heap pages to Windows
-	debug.SetGCPercent(20)
-
 	// Set explicit application user model ID for Windows taskbar branding
 	appId, _ := syscall.UTF16PtrFromString("PCRemote.App")
 	procSetAppUserModelID.Call(uintptr(unsafe.Pointer(appId)))
@@ -116,7 +103,7 @@ func main() {
 		defer procCloseHandle.Call(hMutex)
 	}
 
-	// Load configuration
+	// Load configuration (with DPAPI key protection & legacy migration)
 	cfg, err := config.LoadOrCreate(baseDir)
 	if err != nil {
 		log.Fatalf("Failed to initialize configuration: %v", err)
@@ -146,8 +133,15 @@ func main() {
 		}
 	}
 
-	// Initialize local HTTP server with production timeouts
-	localSrv := server.NewServer(cfg, web.Assets, *flagPort)
+	// Initialize thread-safe Pairing Token Manager & Hardened Replay Guard
+	pairMgr := pairing.NewManager()
+	replayGuard := protocol.NewReplayGuard(120)
+
+	// Initialize Unified Cryptographic Protocol Handler (shared between LAN & Nostr)
+	protoHandler := protocol.NewHandler(cfg, pairMgr, replayGuard)
+
+	// Initialize local HTTP server with unified envelope handler
+	localSrv := server.NewServer(cfg, web.Assets, *flagPort, pairMgr, protoHandler)
 	httpServer := &http.Server{
 		Addr:         fmt.Sprintf("0.0.0.0:%d", *flagPort),
 		Handler:      localSrv,
@@ -165,7 +159,7 @@ func main() {
 	}()
 
 	// Initialize and start decentralized Nostr E2EE relay client
-	relayClient := relay.NewClient(cfg, nil, localSrv.GetPairingToken)
+	relayClient := relay.NewClient(cfg, nil, protoHandler)
 	relayClient.Start()
 
 	// Display pairing information
@@ -191,12 +185,6 @@ func main() {
 		time.Sleep(300 * time.Millisecond)
 		os.Exit(0)
 	})
-
-	// Initial clean memory stabilization
-	go func() {
-		time.Sleep(3 * time.Second)
-		trimWorkingSet()
-	}()
 
 	// Handle graceful shutdown via Ctrl+C / SIGINT
 	go func() {

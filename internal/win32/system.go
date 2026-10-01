@@ -74,13 +74,6 @@ var (
 	lastCpuTime time.Time
 )
 
-func fileTimeToUint64(ft *FileTime) uint64 {
-	if ft == nil {
-		return 0
-	}
-	return ft.ToUint64()
-}
-
 // GetCpuLoad returns current CPU usage percentage (0-100)
 func GetCpuLoad() int {
 	cpuLock.Lock()

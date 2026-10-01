@@ -9,7 +9,7 @@
     lanHost: '',
     deviceName: '',
     phonePubkey: '',
-    phonePrivkey: '',
+    phonePrivkey: '', // Kept in volatile memory only while unlocked
     isPaired: false
   };
 
@@ -99,7 +99,7 @@
     });
   }
 
-  // Cryptographic & Format Validators
+  // --- Cryptographic & Format Validators ---
   function isValidPubkey(key) {
     return typeof key === 'string' && /^[0-9a-fA-F]{64}$/.test(key);
   }
@@ -122,46 +122,165 @@
     return 'Mobile Remote';
   }
 
-  // Load stored credentials from localStorage
-  function loadStoredConfig() {
-    const raw = localStorage.getItem('pcremote_cfg') || localStorage.getItem('laptopcontrol_cfg');
-    if (raw) {
-      try {
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === 'object') {
-          config = { ...config, ...parsed };
-        }
-      } catch (e) {}
+  function hexToBytes(hex) {
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < bytes.length; i++) {
+      bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
     }
+    return bytes;
+  }
 
-    if (config.deviceName) {
-      deviceName.textContent = config.deviceName;
+  function bytesToHex(bytes) {
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  // --- IndexedDB & Web Crypto Vault ---
+  const VAULT_DB_NAME = 'PCRemoteVaultDB';
+  const VAULT_STORE = 'vault';
+
+  function openVaultDB() {
+    return new Promise((resolve, reject) => {
+      if (!window.indexedDB) {
+        return reject(new Error('IndexedDB not supported'));
+      }
+      const req = indexedDB.open(VAULT_DB_NAME, 1);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains(VAULT_STORE)) {
+          db.createObjectStore(VAULT_STORE);
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function saveVaultAuth(vaultData) {
+    try {
+      const db = await openVaultDB();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(VAULT_STORE, 'readwrite');
+        tx.objectStore(VAULT_STORE).put(vaultData, 'auth');
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    } catch (e) {
+      // Transparent fallback to localStorage if IndexedDB is unavailable
+      localStorage.setItem('pcremote_vault_auth', JSON.stringify(vaultData));
     }
   }
 
+  async function loadVaultAuth() {
+    try {
+      const db = await openVaultDB();
+      const result = await new Promise((resolve, reject) => {
+        const tx = db.transaction(VAULT_STORE, 'readonly');
+        const req = tx.objectStore(VAULT_STORE).get('auth');
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+      if (result) return result;
+    } catch (e) {}
+
+    // Check localStorage fallback
+    const raw = localStorage.getItem('pcremote_vault_auth');
+    if (raw) {
+      try {
+        return JSON.parse(raw);
+      } catch (e) {}
+    }
+
+    // Check legacy unencrypted config for seamless migration
+    const legacyRaw = localStorage.getItem('pcremote_cfg') || localStorage.getItem('laptopcontrol_cfg');
+    if (legacyRaw) {
+      try {
+        const legacy = JSON.parse(legacyRaw);
+        if (legacy && legacy.isPaired && legacy.phonePrivkey) {
+          return {
+            legacy: true,
+            phonePrivkey: legacy.phonePrivkey,
+            phonePubkey: legacy.phonePubkey,
+            laptopPubkey: legacy.laptopPubkey,
+            deviceName: legacy.deviceName,
+            lanHost: legacy.lanHost,
+            isPaired: true
+          };
+        }
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  // Web Crypto Key Derivation & AES-GCM
+  async function deriveAesKey(pin, saltBytes) {
+    const enc = new TextEncoder();
+    const subtle = window.crypto.subtle;
+    const pinKey = await subtle.importKey(
+      'raw',
+      enc.encode(pin),
+      { name: 'PBKDF2' },
+      false,
+      ['deriveKey']
+    );
+    return await subtle.deriveKey(
+      {
+        name: 'PBKDF2',
+        salt: saltBytes,
+        iterations: 100000,
+        hash: 'SHA-256'
+      },
+      pinKey,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['encrypt', 'decrypt']
+    );
+  }
+
+  async function encryptPrivkeyWithPin(pin, privkeyHex) {
+    const saltBytes = window.crypto.getRandomValues(new Uint8Array(16));
+    const ivBytes = window.crypto.getRandomValues(new Uint8Array(12));
+    const aesKey = await deriveAesKey(pin, saltBytes);
+    const enc = new TextEncoder();
+    const ctBuffer = await window.crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv: ivBytes },
+      aesKey,
+      enc.encode(privkeyHex)
+    );
+    return {
+      saltHex: bytesToHex(saltBytes),
+      ivHex: bytesToHex(ivBytes),
+      ciphertextHex: bytesToHex(new Uint8Array(ctBuffer))
+    };
+  }
+
+  async function decryptPrivkeyWithPin(pin, vaultData) {
+    if (!vaultData || !vaultData.saltHex || !vaultData.ivHex || !vaultData.ciphertextHex) {
+      throw new Error('Vault missing or incomplete');
+    }
+    const saltBytes = hexToBytes(vaultData.saltHex);
+    const ivBytes = hexToBytes(vaultData.ivHex);
+    const ctBytes = hexToBytes(vaultData.ciphertextHex);
+    const aesKey = await deriveAesKey(pin, saltBytes);
+    const decryptedBuffer = await window.crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: ivBytes },
+      aesKey,
+      ctBytes
+    );
+    return new TextDecoder().decode(decryptedBuffer);
+  }
+
   function ensurePhoneKeys() {
+    if (config.isPaired) {
+      // When paired, phonePubkey is established and phonePrivkey is only loaded via local PIN unlock
+      return;
+    }
     if (!config.phonePrivkey || !config.phonePubkey) {
       if (typeof NostrTools !== 'undefined' && NostrTools.generateSecretKey) {
         const sk = NostrTools.generateSecretKey();
         config.phonePrivkey = NostrTools.utils.bytesToHex(sk);
         config.phonePubkey = NostrTools.getPublicKey(sk);
-        if (config.isPaired) {
-          saveConfig();
-        }
       }
     }
-  }
-
-  function saveConfig() {
-    localStorage.setItem('pcremote_cfg', JSON.stringify({
-      laptopPubkey: config.laptopPubkey,
-      pairingToken: config.pairingToken,
-      lanHost: config.lanHost,
-      deviceName: config.deviceName,
-      phonePubkey: config.phonePubkey,
-      phonePrivkey: config.phonePrivkey,
-      isPaired: !!config.isPaired
-    }));
   }
 
   function showToast(msg) {
@@ -231,10 +350,8 @@
   }
 
   // State Machine Evaluator
-  function evaluateInitialState() {
-    loadStoredConfig();
-
-    // 1. Inspect URL Fragment
+  async function evaluateInitialState() {
+    // 1. Inspect URL Fragment first
     const hash = window.location.hash.substring(1);
     let urlPair = null;
     let urlKey = null;
@@ -259,13 +376,11 @@
 
     // 2. Case: Arrived with URL pairing parameters (QR Code scan)
     if (hasUrlParams) {
-      // Validate cryptographic structure strictly before trusting
       if (!isValidPubkey(urlKey) || !isValidPairingToken(urlPair)) {
         showLandingState('invalid');
         return;
       }
 
-      // Valid parameters: set staging config in-memory (NOT marked as paired, not saved yet)
       config.laptopPubkey = urlKey;
       config.pairingToken = urlPair;
       if (urlLan && isValidLanHost(urlLan)) config.lanHost = urlLan;
@@ -276,7 +391,6 @@
         deviceName.textContent = config.deviceName;
       }
 
-      // Display pairing PIN view
       landingStateView.style.display = 'none';
       mainDashboard.style.display = 'none';
       actionStateView.style.display = 'none';
@@ -284,13 +398,24 @@
       pinTitle.textContent = config.deviceName ? `Pair with ${config.deviceName}` : 'Pair with PC';
       pinSubtitle.textContent = 'Enter your 6-digit Master PIN to pair this phone';
 
-      // Connect to Nostr relay mesh for the pairing handshake
       initRelays();
       return;
     }
 
-    // 3. Case: Authenticated Session (Previously paired device)
-    if (config.isPaired && isValidPubkey(config.laptopPubkey)) {
+    // 3. Check stored vault for authenticated session
+    const vault = await loadVaultAuth();
+    if (vault && vault.isPaired && isValidPubkey(vault.laptopPubkey)) {
+      config.laptopPubkey = vault.laptopPubkey || '';
+      config.phonePubkey = vault.phonePubkey || '';
+      config.deviceName = vault.deviceName || '';
+      config.lanHost = vault.lanHost || '';
+      config.isPaired = true;
+      config.phonePrivkey = ''; // Explicitly lock key until local PIN is validated
+
+      if (config.deviceName) {
+        deviceName.textContent = config.deviceName;
+      }
+
       landingStateView.style.display = 'none';
       actionStateView.style.display = 'none';
 
@@ -305,14 +430,12 @@
         startTelemetryLoop();
       }
 
-      // Connect to relays
       initRelays();
       return;
     }
 
     // 4. Case: Direct Public Visit (No pairing context)
     showLandingState('public');
-    // Remain 100% idle. NO WebSockets. NO HTTP calls. NO polling.
   }
 
   // Nostr Relay Mesh Management
@@ -372,7 +495,6 @@
         if (!anyConnected) {
           setStatus('offline', 'DISCONNECTED');
         }
-        // Only reconnect if we are in an active session or pairing mode
         if (config.isPaired || config.pairingToken) {
           setTimeout(() => connectRelay(url), 4000);
         }
@@ -397,17 +519,14 @@
       }
     }
 
+    // Strict NIP-44 v2 decryption (no legacy NIP-04)
     let plaintext = '';
-    if (typeof NostrTools !== 'undefined') {
+    if (typeof NostrTools !== 'undefined' && config.phonePrivkey) {
       try {
         const skBytes = NostrTools.utils.hexToBytes(config.phonePrivkey);
         const convKey = NostrTools.nip44.v2.utils.getConversationKey(skBytes, evt.pubkey);
         plaintext = NostrTools.nip44.v2.decrypt(evt.content, convKey);
-      } catch (e) {
-        try {
-          plaintext = NostrTools.nip04.decrypt(config.phonePrivkey, evt.pubkey, evt.content);
-        } catch (err) {}
-      }
+      } catch (e) {}
     }
 
     if (!plaintext) return;
@@ -423,49 +542,94 @@
     } catch (e) {}
   }
 
-  function sendRelayRequest(action, extraPayload = {}) {
+  // Create unified cryptographic Nostr envelope shared across LAN and Relay
+  function createCommandEnvelope(action, extraPayload = {}) {
+    ensurePhoneKeys();
+
+    if (!config.phonePrivkey || !config.laptopPubkey) {
+      throw new Error('Missing pairing keys. Scan the QR code on your PC.');
+    }
+
+    if (typeof NostrTools === 'undefined') {
+      throw new Error('Nostr cryptography library not loaded.');
+    }
+
+    const reqId = 'req_' + Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
+    const payload = {
+      id: reqId,
+      action: action,
+      timestamp: Math.floor(Date.now() / 1000),
+      ...extraPayload
+    };
+
+    const skBytes = NostrTools.utils.hexToBytes(config.phonePrivkey);
+    const convKey = NostrTools.nip44.v2.utils.getConversationKey(skBytes, config.laptopPubkey);
+    const ciphertext = NostrTools.nip44.v2.encrypt(JSON.stringify(payload), convKey);
+
+    const template = {
+      kind: 4,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [['p', config.laptopPubkey]],
+      content: ciphertext
+    };
+
+    const signedEvt = NostrTools.finalizeEvent(template, skBytes);
+    return { reqId, signedEvt, convKey };
+  }
+
+  // Unified Request Dispatcher (Direct LAN HTTP -> Nostr E2EE Relay Fallback)
+  async function sendRequest(action, extraPayload = {}) {
+    let envelope;
+    try {
+      envelope = createCommandEnvelope(action, extraPayload);
+    } catch (err) {
+      return Promise.reject(err);
+    }
+    const { reqId, signedEvt, convKey } = envelope;
+
+    const canAttemptLan = !!config.lanHost;
+
+    if (canAttemptLan) {
+      const endpoint = `http://${config.lanHost}/api/control`;
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 1400);
+
+        // POST ONLY the signed Nostr envelope! (Zero plaintext PIN!)
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(signedEvt),
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+
+        if (res.ok) {
+          const respEvt = await res.json();
+          // Cryptographically verify laptop signature and decrypt response with NIP-44 v2
+          if (respEvt && respEvt.content && respEvt.pubkey === config.laptopPubkey) {
+            if (typeof NostrTools !== 'undefined' && NostrTools.verifyEvent(respEvt)) {
+              const plain = NostrTools.nip44.v2.decrypt(respEvt.content, convKey);
+              const data = JSON.parse(plain);
+              if (data && data.id === reqId) {
+                setStatus('online', 'LAN DIRECT');
+                return data;
+              }
+            }
+          } else if (respEvt && (respEvt.error || respEvt.status)) {
+            return respEvt;
+          }
+        } else if (res.status === 401 || res.status === 400 || res.status === 403) {
+          const errData = await res.json();
+          return errData;
+        }
+      } catch (e) {
+        // Fall through to Nostr relay pool
+      }
+    }
+
+    // Fallback: publish cryptographic envelope to Nostr relays
     return new Promise((resolve, reject) => {
-      ensurePhoneKeys();
-
-      if (!config.phonePrivkey || !config.laptopPubkey) {
-        return reject(new Error('Missing pairing keys. Scan the QR code on your PC.'));
-      }
-
-      if (typeof NostrTools === 'undefined') {
-        return reject(new Error('Nostr cryptography library not loaded.'));
-      }
-
-      const reqId = 'req_' + Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
-      const payload = {
-        id: reqId,
-        action: action,
-        timestamp: Math.floor(Date.now() / 1000),
-        ...extraPayload
-      };
-
-      let ciphertext = '';
-      const skBytes = NostrTools.utils.hexToBytes(config.phonePrivkey);
-      try {
-        const convKey = NostrTools.nip44.v2.utils.getConversationKey(skBytes, config.laptopPubkey);
-        ciphertext = NostrTools.nip44.v2.encrypt(JSON.stringify(payload), convKey);
-      } catch (e) {
-        return reject(new Error('Encryption failed: ' + e.message));
-      }
-
-      const template = {
-        kind: 4,
-        created_at: Math.floor(Date.now() / 1000),
-        tags: [['p', config.laptopPubkey]],
-        content: ciphertext
-      };
-
-      let signedEvt;
-      try {
-        signedEvt = NostrTools.finalizeEvent(template, skBytes);
-      } catch (e) {
-        return reject(new Error('Failed to sign event: ' + e.message));
-      }
-
       const rawMsg = JSON.stringify(['EVENT', signedEvt]);
       let activeCount = 0;
       for (const [url, ws] of relaySockets.entries()) {
@@ -491,42 +655,6 @@
     });
   }
 
-  // Communication Engine (Direct LAN Probe -> Nostr E2EE Fallback)
-  async function sendRequest(action, extraPayload = {}) {
-    const canAttemptLan = config.lanHost && (
-      window.location.protocol === 'http:' ||
-      window.location.host === config.lanHost
-    );
-
-    if (canAttemptLan) {
-      const endpoint = `http://${config.lanHost}/api/control`;
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 1200);
-        const res = await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            action: action,
-            pin: config.pin,
-            token: config.pairingToken,
-            phonePubKey: config.phonePubkey,
-            timestamp: Math.floor(Date.now() / 1000),
-            ...extraPayload
-          }),
-          signal: controller.signal
-        });
-        clearTimeout(timeoutId);
-        if (res.ok || res.status === 401 || res.status === 403 || res.status === 400) {
-          setStatus('online', 'LAN DIRECT');
-          return await res.json();
-        }
-      } catch (e) {}
-    }
-
-    return sendRelayRequest(action, extraPayload);
-  }
-
   // PIN Keypad Management
   function updatePinDots() {
     for (let i = 0; i < 6; i++) {
@@ -549,72 +677,114 @@
     }
   }
 
-  function verifyPin(pinCandidate) {
-    config.pin = pinCandidate;
-
-    // Pairing Handshake Flow (When device is not yet authorized)
+  async function verifyPin(pinCandidate) {
+    // 1. Initial Pairing Handshake (device not yet paired)
     if (!config.isPaired) {
       showToast('Pairing with PC...');
-      sendRequest('pair', {
-        token: config.pairingToken,
-        pin: pinCandidate,
-        deviceName: getClientDeviceName()
-      })
-        .then((res) => {
-          if (res && res.error) {
-            // Check if token expired
-            if (res.error.toLowerCase().includes('expired') || res.error.toLowerCase().includes('pairing token')) {
-              showLandingState('expired');
-              return;
-            }
-            pinError.textContent = res.error || 'Incorrect Master PIN';
-            enteredPin = '';
-            updatePinDots();
-          } else {
-            // Authenticated successfully!
-            config.isPaired = true;
-            config.pairingToken = '';
-            saveConfig();
-            isLocked = false;
-            pinView.style.display = 'none';
-            landingStateView.style.display = 'none';
-            mainDashboard.style.display = 'flex';
-            if (res.telemetry) updateTelemetryUI(res.telemetry);
-            showToast('Paired successfully with ' + (res.deviceName || 'PC'));
-            startTelemetryLoop();
-          }
-        })
-        .catch((err) => {
-          handlePinError(err);
+      try {
+        const res = await sendRequest('pair', {
+          token: config.pairingToken,
+          pin: pinCandidate,
+          deviceName: getClientDeviceName()
         });
+
+        if (res && res.error) {
+          if (res.error.toLowerCase().includes('expired') || res.error.toLowerCase().includes('pairing token')) {
+            showLandingState('expired');
+            return;
+          }
+          pinError.textContent = res.error || 'Incorrect Master PIN';
+          enteredPin = '';
+          updatePinDots();
+          return;
+        }
+
+        // Successfully paired with laptop!
+        // Encrypt phonePrivkey with Web Crypto AES-GCM key derived from Master PIN
+        const encData = await encryptPrivkeyWithPin(pinCandidate, config.phonePrivkey);
+        await saveVaultAuth({
+          saltHex: encData.saltHex,
+          ivHex: encData.ivHex,
+          ciphertextHex: encData.ciphertextHex,
+          phonePubkey: config.phonePubkey,
+          laptopPubkey: config.laptopPubkey,
+          deviceName: config.deviceName,
+          lanHost: config.lanHost,
+          isPaired: true
+        });
+
+        // Purge any legacy plaintext keys from local storage
+        localStorage.removeItem('pcremote_cfg');
+        localStorage.removeItem('laptopcontrol_cfg');
+
+        config.isPaired = true;
+        config.pairingToken = '';
+        isLocked = false;
+        pinView.style.display = 'none';
+        landingStateView.style.display = 'none';
+        mainDashboard.style.display = 'flex';
+        if (res && res.telemetry) updateTelemetryUI(res.telemetry);
+        showToast('Paired successfully with ' + (res.deviceName || 'PC'));
+        startTelemetryLoop();
+      } catch (err) {
+        handlePinError(err);
+      }
       return;
     }
 
-    // Already Paired: Local unlock & telemetry update
-    sendRequest('telemetry')
-      .then((res) => {
-        if (res && (res.error || res.status === 'unauthorized')) {
-          if (res.error && res.error.includes('not authorized')) {
-            config.isPaired = false;
-            saveConfig();
-            showLandingState('public');
-            return;
-          }
-          pinError.textContent = res.error || 'Connection unauthorized';
-          enteredPin = '';
-          updatePinDots();
-        } else {
-          isLocked = false;
-          pinView.style.display = 'none';
-          landingStateView.style.display = 'none';
-          mainDashboard.style.display = 'flex';
-          updateTelemetryUI(res);
-          startTelemetryLoop();
-        }
-      })
-      .catch((err) => {
-        handlePinError(err);
-      });
+    // 2. Already Paired: Local Phone Session Unlock (Web Crypto PBKDF2/AES-GCM verifier)
+    try {
+      const vault = await loadVaultAuth();
+      if (!vault) {
+        config.isPaired = false;
+        showLandingState('public');
+        return;
+      }
+
+      // Handle legacy migration if unencrypted key was in storage
+      if (vault.legacy && vault.phonePrivkey) {
+        config.phonePrivkey = vault.phonePrivkey;
+        const encData = await encryptPrivkeyWithPin(pinCandidate, config.phonePrivkey);
+        await saveVaultAuth({
+          saltHex: encData.saltHex,
+          ivHex: encData.ivHex,
+          ciphertextHex: encData.ciphertextHex,
+          phonePubkey: config.phonePubkey,
+          laptopPubkey: config.laptopPubkey,
+          deviceName: config.deviceName,
+          lanHost: config.lanHost,
+          isPaired: true
+        });
+        localStorage.removeItem('pcremote_cfg');
+        localStorage.removeItem('laptopcontrol_cfg');
+      } else {
+        // Attempt to decrypt stored private key with candidate PIN
+        // If PIN is wrong, AES-GCM authentication tag check fails and throws error!
+        const decryptedPrivkey = await decryptPrivkeyWithPin(pinCandidate, vault);
+        config.phonePrivkey = decryptedPrivkey;
+      }
+
+      // Unlock session
+      isLocked = false;
+      enteredPin = '';
+      updatePinDots();
+      pinView.style.display = 'none';
+      landingStateView.style.display = 'none';
+      mainDashboard.style.display = 'flex';
+      startTelemetryLoop();
+
+      // Refresh telemetry using phone's cryptographic identity (zero PIN transmitted!)
+      sendRequest('telemetry').then((data) => {
+        const tel = (data && data.telemetry) ? data.telemetry : data;
+        if (tel && !data.error) updateTelemetryUI(tel);
+      }).catch(() => {});
+
+    } catch (err) {
+      // AES-GCM MAC verification failed -> Incorrect PIN
+      pinError.textContent = 'Incorrect PIN';
+      enteredPin = '';
+      updatePinDots();
+    }
   }
 
   function handlePinError(err) {
@@ -700,45 +870,35 @@
     } else {
       btnLock.disabled = false;
       btnLock.classList.remove('is-locked');
-      lockName.textContent = 'Lock';
-      lockDesc.textContent = 'Lock screen immediately';
-      lockRight.innerHTML = '<svg class="control-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>';
+      lockName.textContent = 'Lock Workstation';
+      lockDesc.textContent = 'Lock Windows immediately';
+      lockRight.innerHTML = `
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="9 18 15 12 9 6"/>
+        </svg>`;
     }
   }
 
+  // Telemetry Polling Loop
   function startTelemetryLoop() {
     if (pollInterval) clearInterval(pollInterval);
     pollInterval = setInterval(() => {
       if (!isLocked && config.isPaired) {
-        sendRequest('telemetry').then((res) => {
-          if (res && res.telemetry) updateTelemetryUI(res.telemetry);
-          else if (res) updateTelemetryUI(res);
-        }).catch(() => {});
+        sendRequest('telemetry')
+          .then((data) => {
+            const tel = (data && data.telemetry) ? data.telemetry : data;
+            if (tel && !data.error) updateTelemetryUI(tel);
+          })
+          .catch(() => {});
       }
-    }, 3000);
+    }, 4000);
   }
 
-  // Refresh Button
-  btnRefresh.addEventListener('click', () => {
-    sendRequest('telemetry')
-      .then((data) => {
-        if (data && data.telemetry) updateTelemetryUI(data.telemetry);
-        else if (data) updateTelemetryUI(data);
-        showToast('Telemetry updated');
-      })
-      .catch((e) => showToast('Failed: ' + e.message));
-  });
-
-  // Action Handlers
+  // Workstation Lock Action
   btnLock.addEventListener('click', () => {
     btnLock.disabled = true;
     sendRequest('lock')
       .then((res) => {
-        if (res && res.error) {
-          showToast('Failed: ' + res.error);
-          btnLock.disabled = false;
-          return;
-        }
         showToast('Workstation locked');
         btnLock.classList.add('is-locked');
         lockName.textContent = 'Locked';
@@ -746,7 +906,9 @@
         lockRight.innerHTML = '<span class="locked-badge">Locked</span>';
       })
       .catch((e) => {
-        showToast('Failed: ' + e.message);
+        showToast('Lock failed: ' + (e.message || 'Error'));
+      })
+      .finally(() => {
         btnLock.disabled = false;
       });
   });
@@ -898,6 +1060,8 @@
   });
 
   // Evaluate deterministic initial state on application launch
-  evaluateInitialState();
+  window.__initPromise = evaluateInitialState();
+  window.__verifyPin = verifyPin;
+  window.__config = config;
 
 })();

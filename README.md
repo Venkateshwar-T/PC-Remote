@@ -4,70 +4,93 @@ PC Remote is an open-source, end-to-end encrypted (E2EE) remote control and hard
 
 [![Go Version](https://img.shields.io/badge/go-1.22+-007d9c?style=flat-square)](https://go.dev/)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011%20(x64)-0078d4?style=flat-square)](https://microsoft.com/windows)
-[![Protocol](https://img.shields.io/badge/protocol-Nostr%20E2EE%20(NIP--44)-purple?style=flat-square)](https://github.com/nostr-protocol/nips/blob/master/44.md)
+[![Protocol](https://img.shields.io/badge/protocol-Nostr%20E2EE%20(NIP--44%20v2)-purple?style=flat-square)](https://github.com/nostr-protocol/nips/blob/master/44.md)
 [![License](https://img.shields.io/badge/license-MIT-333333?style=flat-square)](LICENSE)
 
 ---
 
 ## Architecture Overview
 
-PC Remote employs a hybrid dual-path communication architecture designed to operate seamlessly across both private local networks and the public internet without port forwarding, dynamic DNS, or centralized account management.
+PC Remote employs a unified cryptographic architecture: regardless of transport (Direct LAN HTTP or public Nostr relays), every command travels inside the exact same cryptographically signed and NIP-44 encrypted envelope.
 
 ```
-PHONE CLIENT (PWA)                           PUBLIC NOSTR RELAY MESH                     PC REMOTE DAEMON
-===================                           =======================                     ================
-1. Direct LAN Probe  ---- [HTTP Fast-Path (Same Wi-Fi)] --------------------------------> Local Server (:8765)
-                                                                                          
-2. Remote Internet   ---- [NIP-44 Encrypted Nostr Event] ---> (relay.damus.io)  -------> Outbound Subscription
-     (5G / LTE)           Signed with BIP-340 Schnorr         (nos.lol)                   Verifies signature,
-                          Addressed to #p: laptopPubKey       (relay.primal.net)          checks replay guard,
-                                                                                          decrypts payload,
-                          <--- [NIP-44 Encrypted Response] <-- (Broadcast Result) <------ executes Win32 action
+                              PHONE CLIENT (PWA)
+                                      |
+                           Local Master PIN Unlock
+                        (Web Crypto PBKDF2 / AES-GCM)
+                                      |
+                            phonePrivkey (secp256k1)
+                                      |
+                         BIP-340 Sign + NIP-44 Encrypt
+                                      |
+                      +---------------+---------------+
+                      |                               |
+                 Direct LAN                      Nostr Relays
+            POST /api/control               (damus.io, nos.lol,
+        (Cryptographic Envelope)             relay.primal.net)
+                      |                               |
+                      +---------------+---------------+
+                                      |
+                                      v
+                              PC REMOTE DAEMON
+                                      |
+                         1. Verify BIP-340 Signature
+                         2. NIP-44 Decrypt with LaptopPrivKey
+                         3. Server-side Authorization Check
+                         4. Scoped Replay & Freshness Guard
+                         5. Strict Action Allowlist & Bounds Check
+                         6. Native Win32 Execution (Lock, Sleep, Reboot)
 ```
-
-### 1. Direct LAN Mode (Local Wi-Fi)
-When both your phone and PC are connected to the same local network and accessed over direct HTTP, commands are routed directly via local HTTP POST requests with sub-10ms response times.
-
-### 2. Remote Internet Mode (Cellular 5G / Remote Network)
-When outside home Wi-Fi or when mobile browsers enforce Local Network Access / Mixed Content restrictions, PC Remote communicates over the decentralized Nostr relay network:
-* The PC daemon maintains persistent outbound WebSocket connections to multiple independent public Nostr relays (`relay.damus.io`, `nos.lol`, `relay.primal.net`).
-* No incoming ports or router configuration required (NAT-traversal is automatic via outbound connections).
-* The phone publishes signed, end-to-end encrypted commands targeted to the PC's public key.
-* The PC processes the action and publishes an encrypted reply back to the phone.
 
 ---
 
-## Cryptographic Security & Privacy Model
+## Cryptographic Security Model
 
-### True End-to-End Encryption (NIP-44 / NIP-04)
-* **Cryptographic Identity**: Devices use genuine secp256k1 keypairs conforming to BIP-340. Public keys are derived mathematically from private keys.
-* **Ciphertext Guarantees**: All command payloads and telemetry responses are encrypted using **NIP-44 v2** (ChaCha20-Poly1305 with HKDF shared keys and payload padding).
-* **Cryptographic Signatures**: Every transmitted event is authenticated with a BIP-340 Schnorr signature. Tampered payloads or unauthorized senders are dropped immediately.
+### 1. Unified Cryptographic Envelope
+* **Transport Independence**: Whether connecting over local Wi-Fi or the public internet, the command envelope format is identical: a signed Nostr Event (Kind 4) with NIP-44 v2 ciphertext addressed to the laptop's public key (`p` tag).
+* **Zero Plaintext PINs**: The Master PIN is never sent as a plaintext API field over LAN or relay. Remote control commands authenticate using the phone's cryptographic identity (`phonePrivkey` BIP-340 Schnorr signature).
+* **NIP-44 v2 Encryption Only**: Legacy NIP-04 (AES-CBC without padding) has been completely removed. PC Remote strictly uses NIP-44 v2 (ChaCha20-Poly1305 with HKDF-SHA256 and deterministic padding).
 
-### What the Relay Can See vs. Cannot See
+### 2. Master PIN Separation & Browser Vault
+* **Remote Authorization (Laptop)**: During initial pairing, the user enters the 6-digit Master PIN. The laptop verifies the PIN using PBKDF2-HMAC-SHA256 (100,000 iterations), validates the transient pairing token, and authorizes the phone's public key. After pairing, the PIN is never transmitted again.
+* **Local Phone Unlock (Browser)**: When already paired, the phone requires the Master PIN to unlock the local dashboard. The PIN derives an AES-GCM-256 key via Web Crypto PBKDF2 to decrypt `phonePrivkey` stored in IndexedDB.
+* **Integrity Tag Verification**: Arbitrary 6-digit guesses fail the AES-GCM 128-bit authentication tag check and are rejected locally. The Master PIN is never sent to the PC to unlock the UI.
+* **Volatile Memory Only**: The decrypted private key exists in browser memory only while the session is unlocked.
+
+### 3. Windows DPAPI Config Protection
+* **Protected Key at Rest**: The long-term laptop private key is encrypted on disk using Windows Data Protection API (`CryptProtectData`), tied to the user's Windows login session. Plaintext private keys are never stored in `config.json` and are never printed to logs.
+* **Automatic Migration**: Legacy plaintext configurations are migrated to DPAPI automatically on first startup.
+
+### 4. Single-Use Pairing Tokens & Strict Expiry
+* **128-bit Entropy**: Pairing tokens are generated using `crypto/rand` (16 bytes = 32 hex characters).
+* **Enforced 5-Minute Window**: Every pairing validation strictly enforces `time.Now().Before(expiresAt)`.
+* **Atomic Consumption & Race Prevention**: Protected by mutex. Successful pairing consumes the token immediately, regenerates a fresh token for future pairings, and rejects any reuse or concurrent race attempts.
+
+### 5. Hardened ReplayGuard
+* **Sender-Scoped**: Cache keys are scoped to `(senderPubKey, requestID)`, preventing cross-client collision attacks.
+* **Timestamp Cross-Verification**: Both the Nostr `event.CreatedAt` and the inner payload timestamp are checked. Events older than 120 seconds, more than 30 seconds in the future, or differing from the inner timestamp by more than 30 seconds are dropped.
+* **Strictly Bounded Memory**: The replay cache enforces a hard capacity limit with deterministic pruning and eviction of oldest entries, neutralizing memory exhaustion DoS attacks.
+
+---
+
+## What the Relay Sees vs. What the Relay Cannot See
 
 | Data Attribute | Visible to Relay? | Explanation |
 | :--- | :---: | :--- |
-| **Master PIN** | **NO** | The Master PIN is never transmitted over the relay network after initial pairing. |
-| **Control Actions (`lock`, `shutdown`)** | **NO** | Sealed inside NIP-44 AEAD ciphertext. |
-| **System Telemetry (CPU, RAM, Battery)** | **NO** | Encrypted response payload only readable with phone's private key. |
-| **Workstation Identity / Domain** | **NO** | No personal names or domain names are exposed; devices are identified only by 32-byte public key hashes. |
-| **Routing Metadata** | **YES** | The public relay sees event metadata (timestamp, sender public key, and recipient tag `#p`). |
-
-### Replay & Anti-Tamper Protection
-* **Sliding-Window Replay Guard**: Every command contains a cryptographically unique request ID (`id`). The PC maintains a thread-safe sliding-window cache; duplicate request IDs are rejected immediately.
-* **Timestamp Freshness Verification**: Commands older than 120 seconds or drifting more than 60 seconds into the future are dropped to prevent replay attacks.
-* **Device Authorization Whitelist**: Only public keys explicitly authorized during the physical desktop pairing handshake can execute commands. Unknown keys are denied access.
+| **Master PIN** | **NO** | Never transmitted with remote commands. Only present inside ciphertext during initial pairing handshake. |
+| **Command Actions (`lock`, `sleep`, `restart`, `shutdown`)** | **NO** | Sealed inside NIP-44 AEAD ciphertext. |
+| **System Telemetry (CPU, RAM, Battery, Uptime)** | **NO** | Encrypted response payload only readable with phone's private key. |
+| **Workstation Identity / Domain** | **NO** | Devices are identified on the relay network solely by 32-byte public key hashes. |
+| **Private Keys** | **NO** | Private keys never leave their respective hosts. |
+| **Network Metadata** | **YES** | Public relays observe the public key of the sender, the recipient tag (`#p`), event timestamps, and ciphertext size. |
 
 ---
 
-## Workstation Security & Rate Limiting
+## Known Security Boundaries & Limitations
 
-* **Desktop-Exclusive Master PIN**: The 6-digit Master PIN is established on the physical workstation and can only be altered from the physical desktop UI. Remote PIN modification is strictly rejected.
-* **PBKDF2-HMAC-SHA256**: PIN hashes are derived using 100,000 iterations and a 16-byte cryptographically secure random salt.
-* **Timing-Attack Resistance**: Verification uses constant-time byte comparisons (`subtle.ConstantTimeCompare`).
-* **Anti-Brute-Force Lockout**: Five consecutive invalid attempts trigger an automatic 3-minute lockout. Lockout state persists across application restarts.
-* **Restricted CORS**: Cross-Origin Resource Sharing on the local server is restricted to authorized origins (official PWA domain and local subnet IPs), eliminating wildcard `*` exposure.
+* **Browser Storage Sandboxing**: While `phonePrivkey` is encrypted at rest using AES-GCM derived from your Master PIN, browser storage (IndexedDB/localStorage) is subject to the security of the host device. Malicious browser extensions or a compromised mobile OS with root access could inspect application memory.
+* **Relay Metadata**: Public relays can observe traffic timing and the volume of events exchanged between public key hashes.
+* **Windows Standby**: After entering `sleep` or `shutdown`, the PC network interface powers down; waking the PC requires physical power button access or Wake-on-LAN.
 
 ---
 
@@ -94,16 +117,19 @@ When outside home Wi-Fi or when mobile browsers enforce Local Network Access / M
 ### Prerequisites
 * Windows 10 or 11 (64-bit)
 * [Go 1.22+](https://go.dev/dl/)
+* [Node.js 18+](https://nodejs.org/) (for automated state machine testing)
 * [Inno Setup 6](https://jrsoftware.org/isinfo.php) (only needed for packaging the installer)
 
-### Compilation
-
+### Compilation & Tests
 ```cmd
 git clone https://github.com/Venkateshwar-T/PC-Remote.git
 cd PC-Remote
 
-REM Run all unit and cryptographic tests
+REM Run all Go unit and protocol tests
 go test -v ./...
+
+REM Run PWA state machine & Web Crypto security tests
+node tests/state_test.js
 
 REM Build standalone stripped Windows GUI binary (PC-Remote.exe)
 scripts\build.bat

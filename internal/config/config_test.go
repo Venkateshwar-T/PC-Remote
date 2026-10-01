@@ -1,7 +1,10 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/nbd-wtf/go-nostr"
@@ -30,6 +33,72 @@ func TestConfig_KeyGenerationAndDerivation(t *testing.T) {
 	}
 	if cfg.LaptopPubKey != expectedPub {
 		t.Fatalf("Public key mismatch! Got %s, expected %s", cfg.LaptopPubKey, expectedPub)
+	}
+
+	// Verify that LaptopPrivKey is NOT in config.json in plaintext
+	data, err := os.ReadFile(filepath.Join(tempDir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), cfg.LaptopPrivKey) {
+		t.Fatal("SECURITY VIOLATION: Plaintext LaptopPrivKey found in config.json!")
+	}
+	if !strings.Contains(string(data), "laptopPrivKeyEncrypted") {
+		t.Fatal("Expected laptopPrivKeyEncrypted field in config.json")
+	}
+
+	// Verify reload decrypts key correctly
+	cfg2, err := LoadOrCreate(tempDir)
+	if err != nil {
+		t.Fatalf("Reload failed: %v", err)
+	}
+	if cfg2.LaptopPrivKey != cfg.LaptopPrivKey {
+		t.Fatalf("Reloaded private key mismatch! Got %s, expected %s", cfg2.LaptopPrivKey, cfg.LaptopPrivKey)
+	}
+	if cfg2.LaptopPubKey != cfg.LaptopPubKey {
+		t.Fatalf("Reloaded public key mismatch! Got %s, expected %s", cfg2.LaptopPubKey, cfg.LaptopPubKey)
+	}
+}
+
+func TestConfig_MigrationFromLegacyPlaintextKey(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "pcremote_cfg_test_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	legacyPrivKey := nostr.GeneratePrivateKey()
+	legacyPubKey, _ := nostr.GetPublicKey(legacyPrivKey)
+
+	// Write legacy config with plaintext laptopPrivKey
+	legacyJSON := map[string]interface{}{
+		"deviceName":    "Test Laptop",
+		"laptopPrivKey": legacyPrivKey,
+		"laptopPubKey":  legacyPubKey,
+	}
+	rawBytes, _ := json.Marshal(legacyJSON)
+	_ = os.WriteFile(filepath.Join(tempDir, "config.json"), rawBytes, 0600)
+
+	// Load should trigger migration
+	cfg, err := LoadOrCreate(tempDir)
+	if err != nil {
+		t.Fatalf("LoadOrCreate on legacy config failed: %v", err)
+	}
+
+	if cfg.LaptopPrivKey != legacyPrivKey {
+		t.Fatalf("Migrated private key mismatch! Got %s, expected %s", cfg.LaptopPrivKey, legacyPrivKey)
+	}
+	if cfg.LaptopPubKey != legacyPubKey {
+		t.Fatalf("Migrated public key mismatch! Got %s, expected %s", cfg.LaptopPubKey, legacyPubKey)
+	}
+
+	// Verify disk file no longer contains plaintext key
+	savedData, _ := os.ReadFile(filepath.Join(tempDir, "config.json"))
+	if strings.Contains(string(savedData), legacyPrivKey) {
+		t.Fatal("Migration failed to purge plaintext private key from disk!")
+	}
+	if !strings.Contains(string(savedData), "laptopPrivKeyEncrypted") {
+		t.Fatal("Migration failed to generate laptopPrivKeyEncrypted")
 	}
 }
 
