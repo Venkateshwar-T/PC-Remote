@@ -146,11 +146,14 @@ func main() {
 		}
 	}
 
-	// Initialize local HTTP server
+	// Initialize local HTTP server with production timeouts
 	localSrv := server.NewServer(cfg, web.Assets, *flagPort)
 	httpServer := &http.Server{
-		Addr:    fmt.Sprintf("0.0.0.0:%d", *flagPort),
-		Handler: localSrv,
+		Addr:         fmt.Sprintf("0.0.0.0:%d", *flagPort),
+		Handler:      localSrv,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  30 * time.Second,
 	}
 
 	// Start local HTTP server
@@ -161,18 +164,19 @@ func main() {
 		}
 	}()
 
-	// Initialize and start decentralized relay client
-	relayClient := relay.NewClient(cfg, nil)
+	// Initialize and start decentralized Nostr E2EE relay client
+	relayClient := relay.NewClient(cfg, nil, localSrv.GetPairingToken)
 	relayClient.Start()
 
 	// Display pairing information
 	pairingUrl := localSrv.GetPairingURL()
 	fmt.Println("\n========================================================")
-	fmt.Printf("   PC Remote v2.0 (Decentralized Native Edition)\n")
+	fmt.Printf("   PC Remote v2.0 (Nostr E2EE Production Edition)\n")
 	fmt.Printf("   Device: %s\n", cfg.DeviceName)
-	fmt.Printf("   Local Pairing URL: %s\n", pairingUrl)
+	fmt.Printf("   Nostr Public Key: %s\n", cfg.LaptopPubKey)
+	fmt.Printf("   Pairing URL: %s\n", pairingUrl)
 	fmt.Println("========================================================")
-	fmt.Println("\nScan with your phone on the same Wi-Fi to pair:\n")
+	fmt.Println("\nScan with your phone to pair:")
 
 	ansiQR := qr.GenerateTerminalANSI(pairingUrl)
 	if ansiQR != "" {
@@ -188,17 +192,10 @@ func main() {
 		os.Exit(0)
 	})
 
-	// Periodic memory scavenger: flushes unused working set pages back to Windows OS
+	// Initial clean memory stabilization
 	go func() {
-		// Initial trim after initialization settles
 		time.Sleep(3 * time.Second)
 		trimWorkingSet()
-
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			trimWorkingSet()
-		}
 	}()
 
 	// Handle graceful shutdown via Ctrl+C / SIGINT

@@ -1,4 +1,4 @@
-// PC Remote - Professional Client Engine
+// PC Remote - Production Nostr E2EE Client Engine
 (() => {
   'use strict';
 
@@ -7,9 +7,10 @@
     laptopPubkey: '',
     pairingToken: '',
     lanHost: '',
-    pin: '',
+    deviceName: '',
     phonePubkey: '',
-    phonePrivkey: ''
+    phonePrivkey: '',
+    isPaired: false
   };
 
   let isLocked = true;
@@ -18,10 +19,21 @@
   let pendingAction = null;
   let pollInterval = null;
 
-  // DOM Elements
+  // DOM Elements - Views
+  const landingStateView = document.getElementById('landingStateView');
+  const landingIconWrap = document.getElementById('landingIconWrap');
+  const landingTitle = document.getElementById('landingTitle');
+  const landingDesc = document.getElementById('landingDesc');
+  const landingBadge = document.getElementById('landingBadge');
+  const landingBadgeText = document.getElementById('landingBadgeText');
+  const btnLandingAction = document.getElementById('btnLandingAction');
+
   const pinView = document.getElementById('pinView');
-  const mainDashboard = document.getElementById('mainDashboard');
+  const pinTitle = document.getElementById('pinTitle');
+  const pinSubtitle = document.getElementById('pinSubtitle');
   const pinError = document.getElementById('pinError');
+
+  const mainDashboard = document.getElementById('mainDashboard');
   const deviceName = document.getElementById('deviceName');
   const statusIndicator = document.getElementById('statusIndicator');
   const statusLabel = document.getElementById('statusLabel');
@@ -60,7 +72,6 @@
   const toast = document.getElementById('toast');
   const toastText = document.getElementById('toastText');
 
-
   // Action State Screen (Sleep / Restart / Shutdown)
   const actionStateView = document.getElementById('actionStateView');
   const stateIconWrap = document.getElementById('stateIconWrap');
@@ -71,6 +82,16 @@
   const btnStateAction = document.getElementById('btnStateAction');
   let reconnectTimer = null;
 
+  // Multi-Relay Pool (Public Nostr Relays)
+  const RELAYS = [
+    'wss://relay.damus.io',
+    'wss://nos.lol',
+    'wss://relay.primal.net'
+  ];
+
+  const relaySockets = new Map(); // url -> WebSocket
+  const pendingRequests = new Map(); // reqId -> { resolve, reject, timer }
+
   // Register Service Worker for offline PWA capability
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
@@ -78,32 +99,56 @@
     });
   }
 
-  // Load or initialize stored credentials
+  // Cryptographic & Format Validators
+  function isValidPubkey(key) {
+    return typeof key === 'string' && /^[0-9a-fA-F]{64}$/.test(key);
+  }
+
+  function isValidPairingToken(tok) {
+    return typeof tok === 'string' && /^[0-9a-fA-F]{32}$/.test(tok);
+  }
+
+  function isValidLanHost(host) {
+    return typeof host === 'string' && /^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$/.test(host);
+  }
+
+  function getClientDeviceName() {
+    const ua = navigator.userAgent || '';
+    if (/iPhone/i.test(ua)) return 'iPhone Remote';
+    if (/iPad/i.test(ua)) return 'iPad Remote';
+    if (/Android/i.test(ua)) return 'Android Remote';
+    if (/Macintosh/i.test(ua)) return 'Mac Remote';
+    if (/Windows/i.test(ua)) return 'Windows Remote';
+    return 'Mobile Remote';
+  }
+
+  // Load stored credentials from localStorage
   function loadStoredConfig() {
     const raw = localStorage.getItem('pcremote_cfg') || localStorage.getItem('laptopcontrol_cfg');
     if (raw) {
       try {
         const parsed = JSON.parse(raw);
-        config = { ...config, ...parsed };
+        if (parsed && typeof parsed === 'object') {
+          config = { ...config, ...parsed };
+        }
       } catch (e) {}
-    }
-
-    // Parse URL Fragment if arriving from QR code
-    const hash = window.location.hash.substring(1);
-    if (hash) {
-      const params = new URLSearchParams(hash);
-      if (params.get('key')) config.laptopPubkey = params.get('key');
-      if (params.get('pair')) config.pairingToken = params.get('pair');
-      if (params.get('lan')) config.lanHost = params.get('lan');
-      if (params.get('name')) config.deviceName = params.get('name');
-
-      saveConfig();
-      // Clean fragment from address bar so it's not saved in history
-      window.history.replaceState(null, '', window.location.pathname);
     }
 
     if (config.deviceName) {
       deviceName.textContent = config.deviceName;
+    }
+  }
+
+  function ensurePhoneKeys() {
+    if (!config.phonePrivkey || !config.phonePubkey) {
+      if (typeof NostrTools !== 'undefined' && NostrTools.generateSecretKey) {
+        const sk = NostrTools.generateSecretKey();
+        config.phonePrivkey = NostrTools.utils.bytesToHex(sk);
+        config.phonePubkey = NostrTools.getPublicKey(sk);
+        if (config.isPaired) {
+          saveConfig();
+        }
+      }
     }
   }
 
@@ -114,7 +159,8 @@
       lanHost: config.lanHost,
       deviceName: config.deviceName,
       phonePubkey: config.phonePubkey,
-      phonePrivkey: config.phonePrivkey
+      phonePrivkey: config.phonePrivkey,
+      isPaired: !!config.isPaired
     }));
   }
 
@@ -134,6 +180,351 @@
       statusLabel.textContent = text || 'OFFLINE';
       isConnected = false;
     }
+  }
+
+  // Deterministic Landing Views
+  function showLandingState(type) {
+    mainDashboard.style.display = 'none';
+    pinView.style.display = 'none';
+    actionStateView.style.display = 'none';
+    landingStateView.style.display = 'flex';
+
+    if (type === 'public') {
+      landingIconWrap.className = 'state-icon-wrap';
+      landingIconWrap.innerHTML = `
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2" y="3" width="20" height="14" rx="2"/>
+          <line x1="8" y1="21" x2="16" y2="21"/>
+          <line x1="12" y1="17" x2="12" y2="21"/>
+        </svg>`;
+      landingTitle.textContent = 'No Device Paired';
+      landingDesc.textContent = 'Open this page from the pairing QR code displayed by PC Remote on your Windows PC.';
+      landingBadge.style.display = 'none';
+      btnLandingAction.style.display = 'none';
+      setStatus('offline', 'IDLE');
+    } else if (type === 'invalid') {
+      landingIconWrap.className = 'state-icon-wrap is-off';
+      landingIconWrap.innerHTML = `
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+          <line x1="12" y1="9" x2="12" y2="13"/>
+          <line x1="12" y1="17" x2="12.01" y2="17"/>
+        </svg>`;
+      landingTitle.textContent = 'Invalid Pairing Link';
+      landingDesc.textContent = 'The pairing link is malformed or invalid. Generate a new pairing QR code from PC Remote on your Windows PC.';
+      landingBadge.style.display = 'none';
+      btnLandingAction.style.display = 'none';
+      setStatus('offline', 'INVALID');
+    } else if (type === 'expired') {
+      landingIconWrap.className = 'state-icon-wrap is-sleeping';
+      landingIconWrap.innerHTML = `
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"/>
+          <polyline points="12 6 12 12 16 14"/>
+        </svg>`;
+      landingTitle.textContent = 'Pairing Link Expired';
+      landingDesc.textContent = 'This pairing session has expired for your security. Generate a new pairing QR code from PC Remote on your Windows PC.';
+      landingBadge.style.display = 'none';
+      btnLandingAction.style.display = 'none';
+      setStatus('offline', 'EXPIRED');
+    }
+  }
+
+  // State Machine Evaluator
+  function evaluateInitialState() {
+    loadStoredConfig();
+
+    // 1. Inspect URL Fragment
+    const hash = window.location.hash.substring(1);
+    let urlPair = null;
+    let urlKey = null;
+    let urlLan = null;
+    let urlName = null;
+    let hasUrlParams = false;
+
+    if (hash) {
+      try {
+        const params = new URLSearchParams(hash);
+        urlPair = params.get('pair');
+        urlKey = params.get('key');
+        urlLan = params.get('lan');
+        urlName = params.get('name');
+        if (urlPair !== null || urlKey !== null || urlLan !== null || urlName !== null) {
+          hasUrlParams = true;
+        }
+      } catch (e) {}
+      // Immediately clean fragment from visible address bar
+      window.history.replaceState(null, '', window.location.pathname);
+    }
+
+    // 2. Case: Arrived with URL pairing parameters (QR Code scan)
+    if (hasUrlParams) {
+      // Validate cryptographic structure strictly before trusting
+      if (!isValidPubkey(urlKey) || !isValidPairingToken(urlPair)) {
+        showLandingState('invalid');
+        return;
+      }
+
+      // Valid parameters: set staging config in-memory (NOT marked as paired, not saved yet)
+      config.laptopPubkey = urlKey;
+      config.pairingToken = urlPair;
+      if (urlLan && isValidLanHost(urlLan)) config.lanHost = urlLan;
+      if (urlName) config.deviceName = urlName;
+      config.isPaired = false;
+
+      if (config.deviceName) {
+        deviceName.textContent = config.deviceName;
+      }
+
+      // Display pairing PIN view
+      landingStateView.style.display = 'none';
+      mainDashboard.style.display = 'none';
+      actionStateView.style.display = 'none';
+      pinView.style.display = 'flex';
+      pinTitle.textContent = config.deviceName ? `Pair with ${config.deviceName}` : 'Pair with PC';
+      pinSubtitle.textContent = 'Enter your 6-digit Master PIN to pair this phone';
+
+      // Connect to Nostr relay mesh for the pairing handshake
+      initRelays();
+      return;
+    }
+
+    // 3. Case: Authenticated Session (Previously paired device)
+    if (config.isPaired && isValidPubkey(config.laptopPubkey)) {
+      landingStateView.style.display = 'none';
+      actionStateView.style.display = 'none';
+
+      if (isLocked) {
+        pinTitle.textContent = 'Enter your 6-digit PIN';
+        pinSubtitle.textContent = config.deviceName ? `Authenticate to control ${config.deviceName}` : 'Authenticate to control this PC';
+        mainDashboard.style.display = 'none';
+        pinView.style.display = 'flex';
+      } else {
+        pinView.style.display = 'none';
+        mainDashboard.style.display = 'flex';
+        startTelemetryLoop();
+      }
+
+      // Connect to relays
+      initRelays();
+      return;
+    }
+
+    // 4. Case: Direct Public Visit (No pairing context)
+    showLandingState('public');
+    // Remain 100% idle. NO WebSockets. NO HTTP calls. NO polling.
+  }
+
+  // Nostr Relay Mesh Management
+  function initRelays() {
+    ensurePhoneKeys();
+
+    RELAYS.forEach((url) => {
+      connectRelay(url);
+    });
+  }
+
+  function connectRelay(url) {
+    if (relaySockets.has(url)) {
+      const existing = relaySockets.get(url);
+      if (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING) {
+        return;
+      }
+    }
+
+    try {
+      const ws = new WebSocket(url);
+      relaySockets.set(url, ws);
+
+      ws.onopen = () => {
+        setStatus('online', 'CONNECTED');
+        if (config.phonePubkey) {
+          const subId = 'sub_' + Math.random().toString(36).substring(2, 8);
+          const filter = {
+            kinds: [4],
+            '#p': [config.phonePubkey],
+            since: Math.floor(Date.now() / 1000) - 60
+          };
+          ws.send(JSON.stringify(['REQ', subId, filter]));
+        }
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (!Array.isArray(msg)) return;
+          const [type, subId, evt] = msg;
+          if (type === 'EVENT' && evt && evt.kind === 4) {
+            handleIncomingNostrEvent(evt);
+          }
+        } catch (e) {}
+      };
+
+      ws.onclose = () => {
+        relaySockets.delete(url);
+        let anyConnected = false;
+        for (const sock of relaySockets.values()) {
+          if (sock.readyState === WebSocket.OPEN) {
+            anyConnected = true;
+            break;
+          }
+        }
+        if (!anyConnected) {
+          setStatus('offline', 'DISCONNECTED');
+        }
+        // Only reconnect if we are in an active session or pairing mode
+        if (config.isPaired || config.pairingToken) {
+          setTimeout(() => connectRelay(url), 4000);
+        }
+      };
+
+      ws.onerror = () => {
+        ws.close();
+      };
+    } catch (e) {}
+  }
+
+  function handleIncomingNostrEvent(evt) {
+    if (!evt || !evt.pubkey || !evt.content) return;
+
+    if (config.laptopPubkey && evt.pubkey !== config.laptopPubkey) {
+      return;
+    }
+
+    if (typeof NostrTools !== 'undefined' && NostrTools.verifyEvent) {
+      if (!NostrTools.verifyEvent(evt)) {
+        return;
+      }
+    }
+
+    let plaintext = '';
+    if (typeof NostrTools !== 'undefined') {
+      try {
+        const skBytes = NostrTools.utils.hexToBytes(config.phonePrivkey);
+        const convKey = NostrTools.nip44.v2.utils.getConversationKey(skBytes, evt.pubkey);
+        plaintext = NostrTools.nip44.v2.decrypt(evt.content, convKey);
+      } catch (e) {
+        try {
+          plaintext = NostrTools.nip04.decrypt(config.phonePrivkey, evt.pubkey, evt.content);
+        } catch (err) {}
+      }
+    }
+
+    if (!plaintext) return;
+
+    try {
+      const data = JSON.parse(plaintext);
+      if (data && data.id && pendingRequests.has(data.id)) {
+        const { resolve, timer } = pendingRequests.get(data.id);
+        clearTimeout(timer);
+        pendingRequests.delete(data.id);
+        resolve(data);
+      }
+    } catch (e) {}
+  }
+
+  function sendRelayRequest(action, extraPayload = {}) {
+    return new Promise((resolve, reject) => {
+      ensurePhoneKeys();
+
+      if (!config.phonePrivkey || !config.laptopPubkey) {
+        return reject(new Error('Missing pairing keys. Scan the QR code on your PC.'));
+      }
+
+      if (typeof NostrTools === 'undefined') {
+        return reject(new Error('Nostr cryptography library not loaded.'));
+      }
+
+      const reqId = 'req_' + Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
+      const payload = {
+        id: reqId,
+        action: action,
+        timestamp: Math.floor(Date.now() / 1000),
+        ...extraPayload
+      };
+
+      let ciphertext = '';
+      const skBytes = NostrTools.utils.hexToBytes(config.phonePrivkey);
+      try {
+        const convKey = NostrTools.nip44.v2.utils.getConversationKey(skBytes, config.laptopPubkey);
+        ciphertext = NostrTools.nip44.v2.encrypt(JSON.stringify(payload), convKey);
+      } catch (e) {
+        return reject(new Error('Encryption failed: ' + e.message));
+      }
+
+      const template = {
+        kind: 4,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [['p', config.laptopPubkey]],
+        content: ciphertext
+      };
+
+      let signedEvt;
+      try {
+        signedEvt = NostrTools.finalizeEvent(template, skBytes);
+      } catch (e) {
+        return reject(new Error('Failed to sign event: ' + e.message));
+      }
+
+      const rawMsg = JSON.stringify(['EVENT', signedEvt]);
+      let activeCount = 0;
+      for (const [url, ws] of relaySockets.entries()) {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(rawMsg);
+          activeCount++;
+        }
+      }
+
+      if (activeCount === 0) {
+        initRelays();
+        return reject(new Error('Connecting to Nostr network... Please retry in a moment.'));
+      }
+
+      const timer = setTimeout(() => {
+        if (pendingRequests.has(reqId)) {
+          pendingRequests.delete(reqId);
+          reject(new Error('Request timed out'));
+        }
+      }, 6500);
+
+      pendingRequests.set(reqId, { resolve, reject, timer });
+    });
+  }
+
+  // Communication Engine (Direct LAN Probe -> Nostr E2EE Fallback)
+  async function sendRequest(action, extraPayload = {}) {
+    const canAttemptLan = config.lanHost && (
+      window.location.protocol === 'http:' ||
+      window.location.host === config.lanHost
+    );
+
+    if (canAttemptLan) {
+      const endpoint = `http://${config.lanHost}/api/control`;
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 1200);
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: action,
+            pin: config.pin,
+            token: config.pairingToken,
+            phonePubKey: config.phonePubkey,
+            timestamp: Math.floor(Date.now() / 1000),
+            ...extraPayload
+          }),
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        if (res.ok || res.status === 401 || res.status === 403 || res.status === 400) {
+          setStatus('online', 'LAN DIRECT');
+          return await res.json();
+        }
+      } catch (e) {}
+    }
+
+    return sendRelayRequest(action, extraPayload);
   }
 
   // PIN Keypad Management
@@ -160,30 +551,81 @@
 
   function verifyPin(pinCandidate) {
     config.pin = pinCandidate;
+
+    // Pairing Handshake Flow (When device is not yet authorized)
+    if (!config.isPaired) {
+      showToast('Pairing with PC...');
+      sendRequest('pair', {
+        token: config.pairingToken,
+        pin: pinCandidate,
+        deviceName: getClientDeviceName()
+      })
+        .then((res) => {
+          if (res && res.error) {
+            // Check if token expired
+            if (res.error.toLowerCase().includes('expired') || res.error.toLowerCase().includes('pairing token')) {
+              showLandingState('expired');
+              return;
+            }
+            pinError.textContent = res.error || 'Incorrect Master PIN';
+            enteredPin = '';
+            updatePinDots();
+          } else {
+            // Authenticated successfully!
+            config.isPaired = true;
+            config.pairingToken = '';
+            saveConfig();
+            isLocked = false;
+            pinView.style.display = 'none';
+            landingStateView.style.display = 'none';
+            mainDashboard.style.display = 'flex';
+            if (res.telemetry) updateTelemetryUI(res.telemetry);
+            showToast('Paired successfully with ' + (res.deviceName || 'PC'));
+            startTelemetryLoop();
+          }
+        })
+        .catch((err) => {
+          handlePinError(err);
+        });
+      return;
+    }
+
+    // Already Paired: Local unlock & telemetry update
     sendRequest('telemetry')
       .then((res) => {
-        if (res && res.error) {
-          pinError.textContent = res.error;
+        if (res && (res.error || res.status === 'unauthorized')) {
+          if (res.error && res.error.includes('not authorized')) {
+            config.isPaired = false;
+            saveConfig();
+            showLandingState('public');
+            return;
+          }
+          pinError.textContent = res.error || 'Connection unauthorized';
           enteredPin = '';
           updatePinDots();
         } else {
           isLocked = false;
           pinView.style.display = 'none';
+          landingStateView.style.display = 'none';
           mainDashboard.style.display = 'flex';
           updateTelemetryUI(res);
           startTelemetryLoop();
         }
       })
       .catch((err) => {
-        let msg = err.message || 'Connection failed';
-        if (window.location.protocol === 'https:' && config.lanHost) {
-          pinError.innerHTML = `${msg} — <a href="http://${config.lanHost}/" style="color:#22c55e;text-decoration:underline;">Switch to Direct LAN</a>`;
-        } else {
-          pinError.textContent = msg;
-        }
-        enteredPin = '';
-        updatePinDots();
+        handlePinError(err);
       });
+  }
+
+  function handlePinError(err) {
+    let msg = err.message || 'Connection failed';
+    if (window.location.protocol === 'https:' && config.lanHost) {
+      pinError.innerHTML = `${msg} — <a href="http://${config.lanHost}/" style="color:#22c55e;text-decoration:underline;">Switch to Direct LAN</a>`;
+    } else {
+      pinError.textContent = msg;
+    }
+    enteredPin = '';
+    updatePinDots();
   }
 
   document.querySelectorAll('.keypad-btn[data-key]').forEach(btn => {
@@ -204,104 +646,15 @@
     }
   });
 
-  // Communication Engine (Dual Path: Direct LAN -> Decentralized Relay Fallback)
-  async function sendRequest(action, extraPayload = {}) {
-    const payload = {
-      action: action,
-      pin: config.pin,
-      token: config.pairingToken,
-      timestamp: Math.floor(Date.now() / 1000),
-      ...extraPayload
-    };
-
-    // 1. Try local LAN direct HTTP
-    if (config.lanHost || window.location.origin.includes('http')) {
-      const endpoint = config.lanHost ? `http://${config.lanHost}/api/control` : '/api/control';
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 1800);
-        const res = await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-          signal: controller.signal
-        });
-        clearTimeout(timeoutId);
-        if (res.ok || res.status === 401 || res.status === 403 || res.status === 400) {
-          setStatus('online', 'ONLINE');
-          return await res.json();
-        }
-      } catch (e) {}
-    }
-
-    // 2. Fallback to Decentralized Relay over WebSocket
-    return sendRelayRequest(payload);
-  }
-
-  // Decentralized Relay Pool
-  const RELAYS = [
-    'wss://relay.damus.io'
-  ];
-
-  let relaySockets = [];
-
-  function initRelays() {
-    RELAYS.forEach((url) => {
-      try {
-        const ws = new WebSocket(url);
-        ws.onopen = () => {
-          setStatus('online', 'ONLINE');
-          relaySockets.push(ws);
-        };
-        ws.onclose = () => {
-          relaySockets = relaySockets.filter(s => s !== ws);
-          if (relaySockets.length === 0) setStatus('offline', 'OFFLINE');
-        };
-      } catch (e) {}
-    });
-  }
-
-  function sendRelayRequest(payload) {
-    return new Promise((resolve, reject) => {
-      if (relaySockets.length === 0) {
-        return reject(new Error('No active relay connection'));
-      }
-
-      const reqId = 'req_' + Math.random().toString(36).substring(2, 10);
-      payload.id = reqId;
-
-      const ws = relaySockets[0];
-      const messageHandler = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          if (data && data.id === reqId) {
-            ws.removeEventListener('message', messageHandler);
-            resolve(data);
-          }
-        } catch (e) {}
-      };
-
-      ws.addEventListener('message', messageHandler);
-      setTimeout(() => {
-        ws.removeEventListener('message', messageHandler);
-        reject(new Error('Request timed out'));
-      }, 5000);
-
-      ws.send(JSON.stringify(payload));
-    });
-  }
-
   // Update UI Telemetry
   function updateTelemetryUI(data) {
     if (!data) return;
 
     if (data.deviceName) deviceName.textContent = data.deviceName;
 
-    // Network
     if (data.networkName) networkName.textContent = data.networkName;
     if (data.networkType) networkType.textContent = data.networkType;
 
-    // Battery Box UI
     if (data.battery !== undefined) {
       const pct = Math.min(100, Math.max(0, data.battery));
       batteryPercentText.textContent = `${pct}%`;
@@ -322,26 +675,22 @@
       }
     }
 
-    // CPU
     if (data.cpu !== undefined) {
       cpuValue.textContent = `${data.cpu}%`;
       cpuMeter.style.width = `${Math.min(100, Math.max(0, data.cpu))}%`;
       cpuMeter.className = 'meter-fill ' + (data.cpu >= 80 ? 'red' : (data.cpu >= 50 ? 'amber' : ''));
     }
 
-    // RAM
     if (data.ramPercent !== undefined) {
       ramValue.textContent = `${data.ramPercent}%`;
       ramMeter.style.width = `${Math.min(100, Math.max(0, data.ramPercent))}%`;
       ramGb.textContent = `${data.ramUsedGb || 0} / ${data.ramTotalGb || 0} GB`;
     }
 
-    // Uptime
     if (data.uptime) {
       uptimeValue.textContent = data.uptime;
     }
 
-    // Lock State Management
     if (data.isLocked) {
       btnLock.disabled = true;
       btnLock.classList.add('is-locked');
@@ -360,8 +709,11 @@
   function startTelemetryLoop() {
     if (pollInterval) clearInterval(pollInterval);
     pollInterval = setInterval(() => {
-      if (!isLocked) {
-        sendRequest('telemetry').then(updateTelemetryUI).catch(() => {});
+      if (!isLocked && config.isPaired) {
+        sendRequest('telemetry').then((res) => {
+          if (res && res.telemetry) updateTelemetryUI(res.telemetry);
+          else if (res) updateTelemetryUI(res);
+        }).catch(() => {});
       }
     }, 3000);
   }
@@ -370,7 +722,8 @@
   btnRefresh.addEventListener('click', () => {
     sendRequest('telemetry')
       .then((data) => {
-        updateTelemetryUI(data);
+        if (data && data.telemetry) updateTelemetryUI(data.telemetry);
+        else if (data) updateTelemetryUI(data);
         showToast('Telemetry updated');
       })
       .catch((e) => showToast('Failed: ' + e.message));
@@ -439,20 +792,19 @@
     pendingAction = null;
   });
 
-
-
   function showActionState(action) {
     if (pollInterval) clearInterval(pollInterval);
 
     mainDashboard.style.display = 'none';
     pinView.style.display = 'none';
+    landingStateView.style.display = 'none';
     actionStateView.style.display = 'flex';
 
     if (action === 'sleep') {
       stateIconWrap.className = 'state-icon-wrap is-sleeping';
       stateIconWrap.innerHTML = '<svg viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
-      stateTitle.textContent = 'Laptop is in Sleep Mode';
-      stateDesc.textContent = 'Windows entered low-power standby mode. The remote connection has closed. Press the physical power button on the laptop to wake it up.';
+      stateTitle.textContent = 'PC is in Sleep Mode';
+      stateDesc.textContent = 'Windows entered low-power standby mode. The remote connection has closed. Press the physical power button on the PC to wake it up.';
       stateBadgeDot.className = 'state-badge-dot';
       stateBadgeText.textContent = 'STANDBY • DISCONNECTED';
       btnStateAction.textContent = 'Reconnect when awake';
@@ -472,8 +824,8 @@
     } else if (action === 'shutdown') {
       stateIconWrap.className = 'state-icon-wrap is-off';
       stateIconWrap.innerHTML = '<svg viewBox="0 0 24 24"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>';
-      stateTitle.textContent = 'Laptop is Powered Off';
-      stateDesc.textContent = 'Windows has powered down completely. Remote control is unavailable until the laptop is turned on manually.';
+      stateTitle.textContent = 'PC is Powered Off';
+      stateDesc.textContent = 'Windows has powered down completely. Remote control is unavailable until the PC is turned on manually.';
       stateBadgeDot.className = 'state-badge-dot';
       stateBadgeText.textContent = 'POWERED OFF';
       btnStateAction.textContent = 'Check if turned on';
@@ -488,12 +840,13 @@
     reconnectTimer = setInterval(() => {
       attempts++;
       sendRequest('telemetry').then((data) => {
-        if (data && !data.error) {
+        const tel = (data && data.telemetry) ? data.telemetry : data;
+        if (tel && !data.error) {
           clearInterval(reconnectTimer);
           reconnectTimer = null;
           actionStateView.style.display = 'none';
           mainDashboard.style.display = 'flex';
-          updateTelemetryUI(data);
+          updateTelemetryUI(tel);
           startTelemetryLoop();
           showToast('Reconnected to Windows');
         }
@@ -507,17 +860,18 @@
     btnStateAction.textContent = 'Checking connection...';
     btnStateAction.disabled = true;
     sendRequest('telemetry').then((data) => {
-      if (data && !data.error) {
+      const tel = (data && data.telemetry) ? data.telemetry : data;
+      if (tel && !data.error) {
         actionStateView.style.display = 'none';
         mainDashboard.style.display = 'flex';
-        updateTelemetryUI(data);
+        updateTelemetryUI(tel);
         startTelemetryLoop();
         showToast('Reconnected');
       } else {
-        showToast('Laptop is still offline');
+        showToast('PC is still offline');
       }
     }).catch(() => {
-      showToast('Laptop is still offline');
+      showToast('PC is still offline');
     }).finally(() => {
       btnStateAction.disabled = false;
       btnStateAction.textContent = 'Check connection again';
@@ -543,13 +897,7 @@
     }
   });
 
-  // Initialization
-  loadStoredConfig();
-  initRelays();
-
-  if (isLocked) {
-    mainDashboard.style.display = 'none';
-    pinView.style.display = 'flex';
-  }
+  // Evaluate deterministic initial state on application launch
+  evaluateInitialState();
 
 })();

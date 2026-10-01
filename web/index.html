@@ -14,6 +14,18 @@
 </head>
 <body>
   <div class="app-container">
+    <!-- Landing State Screen (Public Visit / Invalid Link / Expired Link) -->
+    <div id="landingStateView" class="state-view" style="display: none;">
+      <div class="state-icon-wrap" id="landingIconWrap"></div>
+      <div class="state-title" id="landingTitle">No Device Paired</div>
+      <div class="state-desc" id="landingDesc">Open this page from the pairing QR code displayed by PC Remote on your Windows PC.</div>
+      <div id="landingBadge" class="state-badge" style="display: none;">
+        <span class="state-badge-dot"></span>
+        <span class="state-badge-text" id="landingBadgeText"></span>
+      </div>
+      <button class="btn-state-action" id="btnLandingAction" style="display: none; margin-top: 12px;"></button>
+    </div>
+
     <!-- PIN Screen -->
     <div id="pinView" class="pin-view">
       <div class="connection-bridge-wrap">
@@ -41,8 +53,8 @@
         </div>
       </div>
 
-      <div class="pin-title">Enter your 6-digit PIN</div>
-      <div class="pin-subtitle">Authenticate to control this laptop</div>
+      <div class="pin-title" id="pinTitle">Enter your 6-digit PIN</div>
+      <div class="pin-subtitle" id="pinSubtitle">Authenticate to control this PC</div>
       <div class="pin-dots">
         <div class="pin-dot" id="dot0"></div>
         <div class="pin-dot" id="dot1"></div>
@@ -288,6 +300,7 @@
     <span id="toastText">Action sent</span>
   </div>
 
+  <script src="nostr.bundle.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

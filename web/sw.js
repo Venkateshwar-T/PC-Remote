@@ -1,8 +1,9 @@
-const CACHE_NAME = 'pcremote-v3';
+const CACHE_NAME = 'pcremote-v5';
 const ASSETS = [
   './',
   './index.html',
   './style.css',
+  './nostr.bundle.js',
   './app.js',
   './manifest.json',
   './icon.png',

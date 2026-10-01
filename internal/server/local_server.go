@@ -94,25 +94,52 @@ func (s *Server) GetLocalPairingURL() string {
 }
 
 type ControlRequest struct {
-	Action    string `json:"action"`
-	Pin       string `json:"pin"`
-	NewPin    string `json:"new_pin,omitempty"`
-	Token     string `json:"token"`
-	Timestamp int64  `json:"timestamp"`
+	Action      string `json:"action"`
+	Pin         string `json:"pin"`
+	NewPin      string `json:"new_pin,omitempty"`
+	Token       string `json:"token"`
+	PhonePubKey string `json:"phonePubKey,omitempty"`
+	Timestamp   int64  `json:"timestamp"`
 }
 
-func (s *Server) addSecurityHeaders(w http.ResponseWriter) {
+func isAllowedOrigin(origin string) bool {
+	if origin == "" {
+		return false
+	}
+	// Allow Cloudflare Pages deployments
+	if origin == "https://pc-remote-45t.pages.dev" || strings.HasSuffix(origin, ".pages.dev") {
+		return true
+	}
+	// Allow localhost / loopback development
+	if strings.HasPrefix(origin, "http://localhost:") || strings.HasPrefix(origin, "http://127.0.0.1:") {
+		return true
+	}
+	// Allow private LAN origins (192.168.x.x, 10.x.x.x, 172.16-31.x.x)
+	if strings.HasPrefix(origin, "http://192.168.") || strings.HasPrefix(origin, "http://10.") || strings.HasPrefix(origin, "http://172.") {
+		return true
+	}
+	return false
+}
+
+func (s *Server) addSecurityHeaders(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Referrer-Policy", "no-referrer")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	origin := r.Header.Get("Origin")
+	if origin != "" && isAllowedOrigin(origin) {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		w.Header().Set("Vary", "Origin")
+	}
+
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Access-Control-Request-Private-Network")
 	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.addSecurityHeaders(w)
+	s.addSecurityHeaders(w, r)
 
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -194,7 +221,32 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate PIN
+	// Handle pairing action
+	if req.Action == "pair" {
+		if req.Token == "" || req.Token != s.GetPairingToken() {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid or expired pairing token. Scan QR code again."})
+			return
+		}
+		ok, errMsg := s.cfg.VerifyPin(req.Pin)
+		if !ok {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": errMsg})
+			return
+		}
+		if req.PhonePubKey != "" {
+			_ = s.cfg.AuthorizeDevice(req.PhonePubKey, "Direct LAN Phone")
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":     "ok",
+			"message":    "Device paired successfully",
+			"deviceName": s.cfg.DeviceName,
+			"telemetry":  win32.QueryTelemetry(s.cfg.DeviceName),
+		})
+		return
+	}
+
+	// Validate PIN for direct LAN control
 	ok, errMsg := s.cfg.VerifyPin(req.Pin)
 	if !ok {
 		w.WriteHeader(http.StatusUnauthorized)

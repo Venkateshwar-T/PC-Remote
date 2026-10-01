@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/nbd-wtf/go-nostr"
 )
 
 const (
@@ -87,27 +89,42 @@ func LoadOrCreate(baseDir string) (*Config, error) {
 	data, err := os.ReadFile(cfgFile)
 	if err == nil {
 		if err := json.Unmarshal(data, cfg); err == nil {
-			return cfg, nil
+			if cfg.AuthorizedDevices == nil {
+				cfg.AuthorizedDevices = make(map[string]DeviceInfo)
+			}
+			// Verify cryptographic keypair validity
+			validKeys := false
+			if cfg.LaptopPrivKey != "" {
+				derivedPub, err := nostr.GetPublicKey(cfg.LaptopPrivKey)
+				if err == nil && derivedPub != "" {
+					if cfg.LaptopPubKey != derivedPub {
+						cfg.LaptopPubKey = derivedPub
+						_ = cfg.Save()
+					}
+					validKeys = true
+				}
+			}
+			if validKeys {
+				return cfg, nil
+			}
 		}
 	}
 
-	// Generate default keys
+	// Generate default device metadata
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "Windows Laptop"
 	}
 	cfg.DeviceName = hostname
 
-	// Generate 32-byte random keys for device identity
-	priv := make([]byte, 32)
-	rand.Read(priv)
-	pub := make([]byte, 32)
-	rand.Read(pub) // In production, derived via curve25519
-	cfg.LaptopPrivKey = hex.EncodeToString(priv)
-	cfg.LaptopPubKey = hex.EncodeToString(pub)
-
-	// Note: We do NOT set a hardcoded PIN here.
-	// Initial PIN will be established through the setup prompt on PC.
+	// Generate authentic BIP-340 secp256k1 keypair for Nostr identity
+	privKey := nostr.GeneratePrivateKey()
+	pubKey, err := nostr.GetPublicKey(privKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive Nostr public key: %w", err)
+	}
+	cfg.LaptopPrivKey = privKey
+	cfg.LaptopPubKey = pubKey
 
 	if err := cfg.Save(); err != nil {
 		return nil, err
@@ -192,6 +209,10 @@ func (c *Config) AuthorizeDevice(pubKey string, name string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if c.AuthorizedDevices == nil {
+		c.AuthorizedDevices = make(map[string]DeviceInfo)
+	}
+
 	c.AuthorizedDevices[pubKey] = DeviceInfo{
 		Name:     name,
 		AddedAt:  time.Now(),
@@ -200,17 +221,61 @@ func (c *Config) AuthorizeDevice(pubKey string, name string) error {
 	return c.saveLocked()
 }
 
-// IsDeviceAuthorized checks if pubkey is allowed
+// RevokeDevice removes an authorized client device
+func (c *Config) RevokeDevice(pubKey string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.AuthorizedDevices != nil {
+		delete(c.AuthorizedDevices, pubKey)
+		return c.saveLocked()
+	}
+	return nil
+}
+
+// RevokeAllDevices unpairs all registered devices
+func (c *Config) RevokeAllDevices() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.AuthorizedDevices = make(map[string]DeviceInfo)
+	return c.saveLocked()
+}
+
+// UpdateDeviceLastSeen refreshes the last active timestamp for an authorized device
+func (c *Config) UpdateDeviceLastSeen(pubKey string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if dev, ok := c.AuthorizedDevices[pubKey]; ok {
+		dev.LastSeen = time.Now()
+		c.AuthorizedDevices[pubKey] = dev
+		_ = c.saveLocked()
+	}
+}
+
+// IsDeviceAuthorized strictly checks if a pubkey is explicitly authorized
 func (c *Config) IsDeviceAuthorized(pubKey string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	// If no devices registered yet, allow pairing mode
-	if len(c.AuthorizedDevices) == 0 {
-		return true
+	if c.AuthorizedDevices == nil || len(c.AuthorizedDevices) == 0 {
+		return false
 	}
 	_, ok := c.AuthorizedDevices[pubKey]
 	return ok
+}
+
+// GetAuthorizedDevices returns a snapshot copy of authorized devices
+func (c *Config) GetAuthorizedDevices() map[string]DeviceInfo {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	res := make(map[string]DeviceInfo, len(c.AuthorizedDevices))
+	for k, v := range c.AuthorizedDevices {
+		res[k] = v
+	}
+	return res
 }
 
 // Save persists config to file
