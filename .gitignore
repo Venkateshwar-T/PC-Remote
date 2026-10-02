@@ -23,6 +23,3 @@ Desktop.ini
 # Temporary and log files
 *.log
 *.tmp
-
-# Local SDK reference headers
-sdk_headers/

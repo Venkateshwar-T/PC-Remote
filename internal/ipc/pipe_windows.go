@@ -275,12 +275,7 @@ func (l *PipeListener) Close() error {
 		return nil
 	}
 	l.closed = true
-	h := l.curHandle
 	l.mu.Unlock()
-
-	if h != 0 {
-		_ = windows.CancelIoEx(h, nil)
-	}
 
 	// Connect dummy client to release blocked ConnectNamedPipe call immediately
 	hWake, err := windows.CreateFile(

@@ -13,8 +13,6 @@ import (
 	"laptopcontrol/internal/pairing"
 	"laptopcontrol/internal/protocol"
 	"laptopcontrol/internal/relay"
-	"laptopcontrol/internal/remote"
-	"laptopcontrol/internal/remote/session"
 	"laptopcontrol/internal/server"
 	"laptopcontrol/internal/win32"
 	"laptopcontrol/web"
@@ -28,7 +26,6 @@ type Daemon struct {
 	cfg         *config.Config
 	pairMgr     *pairing.Manager
 	proto       *protocol.Handler
-	remoteMgr   *remote.SessionManager
 	localSrv    *server.Server
 	httpServer  *http.Server
 	relayClient *relay.Client
@@ -86,12 +83,7 @@ func (d *Daemon) Start() error {
 	protoHandler := protocol.NewHandler(cfg, pairMgr, replayGuard)
 	d.proto = protoHandler
 
-	// 5. Initialize Remote Desktop Session Manager
-	remoteMgr := remote.NewSessionManager(cfg)
-	d.remoteMgr = remoteMgr
-	protoHandler.SetRemoteManager(remoteMgr)
-
-	// 6. Initialize LAN HTTP Server
+	// 5. Initialize LAN HTTP Server
 	localSrv := server.NewServer(cfg, web.Assets, d.port, pairMgr, protoHandler)
 	d.localSrv = localSrv
 	d.httpServer = &http.Server{
@@ -102,14 +94,9 @@ func (d *Daemon) Start() error {
 		IdleTimeout:  30 * time.Second,
 	}
 
-	// 7. Initialize Nostr Relay Client
+	// 6. Initialize Nostr Relay Client
 	relayClient := relay.NewClient(cfg, nil, protoHandler)
 	d.relayClient = relayClient
-
-	// Wire outbound Remote Desktop WebRTC signaling publisher over Nostr relay pool
-	remoteMgr.SetOutboundSignalHandler(func(phonePubKey string, packet session.SignalingPacket) {
-		d.publishSignal(phonePubKey, packet)
-	})
 
 	// 7. Configure IPC Handlers for communication with interactive desktop tray
 	ipcHandlers := ipc.Handlers{
@@ -231,23 +218,6 @@ func (d *Daemon) Start() error {
 	return nil
 }
 
-// publishSignal encrypts and publishes a Remote Desktop signaling packet to the paired phone.
-// Used both for normal WebRTC negotiation and for out-of-band failure notifications.
-func (d *Daemon) publishSignal(phonePubKey string, packet session.SignalingPacket) {
-	if d.proto == nil || d.relayClient == nil {
-		return
-	}
-	respEvt, err := d.proto.BuildEncryptedResponsePacket(phonePubKey, protocol.ResponsePacket{
-		ID:        fmt.Sprintf("sig_%d", time.Now().UnixNano()),
-		Status:    "ok",
-		Signal:    &packet,
-		Timestamp: time.Now().Unix(),
-	})
-	if err == nil && respEvt != nil {
-		d.relayClient.PublishEvent(respEvt)
-	}
-}
-
 // Stop cleanly flushes config and halts all listeners
 func (d *Daemon) Stop() {
 	d.stopOnce.Do(func() {
@@ -266,10 +236,6 @@ func (d *Daemon) Stop() {
 
 		if d.relayClient != nil {
 			d.relayClient.Stop()
-		}
-
-		if d.remoteMgr != nil {
-			d.remoteMgr.Close()
 		}
 
 		if d.cfg != nil {

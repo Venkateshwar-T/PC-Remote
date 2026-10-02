@@ -129,9 +129,7 @@ function createMockEnvironment(initialHash = '', initialStorage = {}) {
     },
     document: {
       getElementById: (id) => getElement(id),
-      querySelectorAll: () => [],
-      addEventListener: () => {},
-      removeEventListener: () => {}
+      querySelectorAll: () => []
     },
     navigator: {
       userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',

@@ -16,7 +16,6 @@ import (
 	"github.com/nbd-wtf/go-nostr"
 	"laptopcontrol/internal/config"
 	"laptopcontrol/internal/ipc"
-	"laptopcontrol/internal/remote/worker"
 	"laptopcontrol/internal/service"
 	"laptopcontrol/internal/tray"
 )
@@ -59,9 +58,6 @@ func main() {
 			return
 		case "tray", "-tray", "--tray":
 			runTrayCommand(os.Args[2:])
-			return
-		case "session-agent", "-session-agent", "--session-agent":
-			runSessionAgentCommand(os.Args[2:])
 			return
 		case "install":
 			exePath, err := os.Executable()
@@ -316,31 +312,3 @@ func isAllDigits(s string) bool {
 	}
 	return true
 }
-
-func runSessionAgentCommand(args []string) {
-	fs := flag.NewFlagSet("session-agent", flag.ExitOnError)
-	sessionID := fs.String("session-id", "", "Remote session ID")
-	pipeName := fs.String("pipe", "", "Daemon session named pipe name")
-	challenge := fs.String("challenge", "", "In-band authentication challenge token")
-	phonePubKey := fs.String("phone-pubkey", "", "Authorized phone public key")
-	_ = fs.Parse(args)
-
-	if *sessionID == "" || *pipeName == "" || *challenge == "" || *phonePubKey == "" {
-		log.Fatalf("Missing required session-agent arguments")
-	}
-
-	cfg := worker.AgentConfig{
-		SessionID:     *sessionID,
-		PipeName:      *pipeName,
-		AuthChallenge: *challenge,
-		PhonePubKey:   *phonePubKey,
-	}
-
-	agent := worker.NewSessionAgent(cfg)
-	if err := agent.Run(); err != nil {
-		log.Printf("[Agent] [Session: %s] worker exited, exit reason: %v", *sessionID, err)
-		log.Fatalf("Session-agent execution error: %v", err)
-	}
-	log.Printf("[Agent] [Session: %s] worker exited, exit reason: clean shutdown", *sessionID)
-}
-
