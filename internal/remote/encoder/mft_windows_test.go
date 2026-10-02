@@ -8,6 +8,77 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// TestMFT_VTableIndices locks down the absolute COM vtable indices used against
+// IMFTransform. Indices continue from IUnknown (slots 0-2), so an off-by-N here
+// invokes an unrelated method with a mismatched signature and fails at runtime
+// with a misleading HRESULT (e.g. 8 = GetAttributes -> E_POINTER 0x80004003).
+func TestMFT_VTableIndices(t *testing.T) {
+	// IMFTransform methods in declaration order after the IUnknown base.
+	order := []string{
+		"GetStreamLimits",           // 3
+		"GetStreamCount",            // 4
+		"GetStreamIDs",              // 5
+		"GetInputStreamInfo",        // 6
+		"GetOutputStreamInfo",       // 7
+		"GetAttributes",             // 8
+		"GetInputStreamAttributes",  // 9
+		"GetOutputStreamAttributes", // 10
+		"DeleteInputStream",         // 11
+		"AddInputStreams",           // 12
+		"GetInputAvailableType",     // 13
+		"GetOutputAvailableType",    // 14
+		"SetInputType",              // 15
+		"SetOutputType",             // 16
+		"GetInputCurrentType",       // 17
+		"GetOutputCurrentType",      // 18
+		"GetInputStatus",            // 19
+		"GetOutputStatus",           // 20
+		"SetOutputBounds",           // 21
+		"ProcessEvent",              // 22
+		"ProcessMessage",            // 23
+		"ProcessInput",              // 24
+		"ProcessOutput",             // 25
+	}
+
+	indexOf := func(name string) int {
+		for i, m := range order {
+			if m == name {
+				return 3 + i // 3 == IUnknown.QueryInterface, AddRef, Release
+			}
+		}
+		t.Fatalf("method %q not in IMFTransform declaration order", name)
+		return -1
+	}
+
+	cases := []struct {
+		name string
+		got  int
+		want string
+	}{
+		{"SetInputType", vtIMFTransformSetInputType, "SetInputType"},
+		{"SetOutputType", vtIMFTransformSetOutputType, "SetOutputType"},
+		{"ProcessMessage", vtIMFTransformProcessMessage, "ProcessMessage"},
+		{"ProcessInput", vtIMFTransformProcessInput, "ProcessInput"},
+		{"ProcessOutput", vtIMFTransformProcessOutput, "ProcessOutput"},
+	}
+
+	for _, tc := range cases {
+		want := indexOf(tc.want)
+		if tc.got != want {
+			t.Errorf("%s: vtable index = %d, want %d", tc.name, tc.got, want)
+		}
+	}
+
+	// Guard the specific regression: 8 is GetAttributes, not SetOutputType.
+	if vtIMFTransformSetOutputType == 8 {
+		t.Error("SetOutputType must not use index 8 (that is GetAttributes -> E_POINTER)")
+	}
+	if vtIMFTransformSetInputType != 15 || vtIMFTransformSetOutputType != 16 {
+		t.Errorf("SetInputType/SetOutputType must be 15/16, got %d/%d",
+			vtIMFTransformSetInputType, vtIMFTransformSetOutputType)
+	}
+}
+
 func TestMFT_GUIDsAgainstWindowsSDK(t *testing.T) {
 	tests := []struct {
 		name     string

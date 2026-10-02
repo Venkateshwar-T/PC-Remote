@@ -17,13 +17,13 @@ var (
 	modOle32  = windows.NewLazySystemDLL("ole32.dll")
 	modMFPlat = windows.NewLazySystemDLL("mfplat.dll")
 
-	procCoInitializeEx        = modOle32.NewProc("CoInitializeEx")
-	procCoCreateInstance      = modOle32.NewProc("CoCreateInstance")
-	procMFStartup             = modMFPlat.NewProc("MFStartup")
-	procMFShutdown            = modMFPlat.NewProc("MFShutdown")
-	procMFCreateMediaType     = modMFPlat.NewProc("MFCreateMediaType")
-	procMFCreateSample        = modMFPlat.NewProc("MFCreateSample")
-	procMFCreateMemoryBuffer  = modMFPlat.NewProc("MFCreateMemoryBuffer")
+	procCoInitializeEx       = modOle32.NewProc("CoInitializeEx")
+	procCoCreateInstance     = modOle32.NewProc("CoCreateInstance")
+	procMFStartup            = modMFPlat.NewProc("MFStartup")
+	procMFShutdown           = modMFPlat.NewProc("MFShutdown")
+	procMFCreateMediaType    = modMFPlat.NewProc("MFCreateMediaType")
+	procMFCreateSample       = modMFPlat.NewProc("MFCreateSample")
+	procMFCreateMemoryBuffer = modMFPlat.NewProc("MFCreateMemoryBuffer")
 
 	// GUIDs
 	clsidCMSH264EncoderMFT = windows.GUID{
@@ -70,18 +70,73 @@ var (
 		Data1: 0xe272446c, Data2: 0xe767, Data3: 0x4972,
 		Data4: [8]byte{0xb0, 0x12, 0x18, 0xd5, 0x22, 0x6f, 0x0e, 0x39},
 	}
+	guidMFMTMPEG2Profile = windows.GUID{
+		Data1: 0xad76a80b, Data2: 0x2d5c, Data3: 0x4e0b,
+		Data4: [8]byte{0xb3, 0x75, 0x64, 0xe5, 0x20, 0x13, 0x70, 0x36},
+	}
 )
+
+// H.264 profile (eAVEncH264VProfile). Main profile is broadly compatible with
+// browsers while giving better compression than Baseline.
+const eAVEncH264VProfile_Main = 77
 
 const (
 	CLSCTX_INPROC_SERVER = 1
 	COINIT_MULTITHREADED = 0
 
-	MF_VERSION             = 0x00020070
-	MFSTARTUP_NOSOCKET     = 1
-	MFVideoInterlace_Prog  = 2
+	MF_VERSION            = 0x00020070
+	MFSTARTUP_NOSOCKET    = 1
+	MFVideoInterlace_Prog = 2
 
-	MFT_MESSAGE_COMMAND_FLUSH = 0x00000000
+	MFT_MESSAGE_COMMAND_FLUSH          = 0x00000000
 	MFT_MESSAGE_NOTIFY_BEGIN_STREAMING = 0x10000000
+)
+
+// COM vtable indices, absolute from IUnknown.
+//
+// Vtable indices continue from the base interface rather than restarting, so
+// IUnknown occupies slots 0-2 (QueryInterface/AddRef/Release) and the
+// interface's own methods begin at 3. Getting one of these wrong calls an
+// unrelated method with a mismatched signature, which surfaces as a confusing
+// HRESULT at runtime (e.g. using 8 for SetOutputType calls GetAttributes, which
+// writes through an IMFAttributes** out-parameter and fails with E_POINTER).
+//
+// IMFTransform, in declaration order (own methods start at 3):
+//
+//	 3 GetStreamLimits         14 GetInputAvailableType
+//	 4 GetStreamCount          15 SetInputType
+//	 5 GetStreamIDs            16 SetOutputType
+//	 6 GetInputStreamInfo      17 GetInputCurrentType
+//	 7 GetOutputStreamInfo     18 GetOutputCurrentType
+//	 8 GetAttributes           19 GetInputStatus
+//	 9 GetInputStreamAttributes 20 GetOutputStatus
+//	10 GetOutputStreamAttributes 21 SetOutputBounds
+//	11 DeleteInputStream      22 ProcessEvent
+//	12 AddInputStreams        23 ProcessMessage
+//	13 GetOutputAvailableType 24 ProcessInput
+//	                          25 ProcessOutput
+const (
+	vtIMFTransformSetInputType   = 15
+	vtIMFTransformSetOutputType  = 16
+	vtIMFTransformProcessMessage = 23
+	vtIMFTransformProcessInput   = 24
+	vtIMFTransformProcessOutput  = 25
+)
+
+// IMFMediaBuffer, in declaration order (own methods start at 3):
+// 3 Lock, 4 Unlock, 5 GetCurrentLength, 6 SetCurrentLength, ...
+const (
+	vtIMFMediaBufferLock             = 3
+	vtIMFMediaBufferUnlock           = 4
+	vtIMFMediaBufferSetCurrentLength = 6
+)
+
+// IMFSample, in declaration order (own methods start at 3):
+// 3 GetSampleFlags, ... 37 SetSampleTime, 39 SetSampleDuration, 42 AddBuffer
+const (
+	vtIMFSampleSetSampleTime     = 37
+	vtIMFSampleSetSampleDuration = 39
+	vtIMFSampleAddBuffer         = 42
 )
 
 type mftOutputDataBuffer struct {
@@ -166,9 +221,11 @@ func (e *MFTEncoder) Init(width, height, fps, bitrate int) error {
 	setUINT64(pOutputType, guidMFMTFrameRate, packUINT64(uint32(fps), 1))
 	setUINT32(pOutputType, guidMFMTAvgBitrate, uint32(bitrate))
 	setUINT32(pOutputType, guidMFMTInterlaceMode, MFVideoInterlace_Prog)
+	// The H.264 encoder MFT conventionally expects an explicit profile.
+	setUINT32(pOutputType, guidMFMTMPEG2Profile, eAVEncH264VProfile_Main)
 
-	// IMFTransform::SetOutputType (vtable index 8)
-	r = comCall(pMFT, 8, 0, pOutputType, 0)
+	// IMFTransform::SetOutputType (vtable index 16)
+	r = comCall(pMFT, vtIMFTransformSetOutputType, 0, pOutputType, 0)
 	if int32(r) < 0 {
 		return fmt.Errorf("IMFTransform::SetOutputType(H264) failed: 0x%08X", r)
 	}
@@ -187,14 +244,14 @@ func (e *MFTEncoder) Init(width, height, fps, bitrate int) error {
 	setUINT64(pInputType, guidMFMTFrameRate, packUINT64(uint32(fps), 1))
 	setUINT32(pInputType, guidMFMTInterlaceMode, MFVideoInterlace_Prog)
 
-	// IMFTransform::SetInputType (vtable index 9)
-	r = comCall(pMFT, 9, 0, pInputType, 0)
+	// IMFTransform::SetInputType (vtable index 15)
+	r = comCall(pMFT, vtIMFTransformSetInputType, 0, pInputType, 0)
 	if int32(r) < 0 {
 		return fmt.Errorf("IMFTransform::SetInputType(NV12) failed: 0x%08X", r)
 	}
 
-	// Notify MFT to begin streaming: IMFTransform::ProcessMessage (vtable index 22)
-	comCall(pMFT, 22, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
+	// Notify MFT to begin streaming: IMFTransform::ProcessMessage (vtable index 23)
+	comCall(pMFT, vtIMFTransformProcessMessage, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
 
 	e.width = width
 	e.height = height
@@ -239,39 +296,39 @@ func (e *MFTEncoder) Encode(bgra []byte, pts time.Duration) ([][]byte, bool, err
 	}
 	defer comRelease(pInputBuf)
 
-	// Lock buffer: IMFMediaBuffer::Lock (vtable index 3)
+	// Lock buffer: IMFMediaBuffer::Lock
 	var pDstData uintptr
 	var maxLen, curLen uint32
-	r = comCall(pInputBuf, 3, uintptr(unsafe.Pointer(&pDstData)), uintptr(unsafe.Pointer(&maxLen)), uintptr(unsafe.Pointer(&curLen)))
+	r = comCall(pInputBuf, vtIMFMediaBufferLock, uintptr(unsafe.Pointer(&pDstData)), uintptr(unsafe.Pointer(&maxLen)), uintptr(unsafe.Pointer(&curLen)))
 	if int32(r) < 0 {
 		return nil, false, fmt.Errorf("IMFMediaBuffer::Lock failed: 0x%08X", r)
 	}
 
 	copy(unsafe.Slice((*byte)(unsafe.Pointer(pDstData)), inputSize), e.nv12Buffer)
 
-	// Unlock: IMFMediaBuffer::Unlock (vtable index 4)
-	comCall(pInputBuf, 4)
-	// SetCurrentLength: IMFMediaBuffer::SetCurrentLength (vtable index 6)
-	comCall(pInputBuf, 6, uintptr(inputSize))
+	// Unlock: IMFMediaBuffer::Unlock
+	comCall(pInputBuf, vtIMFMediaBufferUnlock)
+	// SetCurrentLength: IMFMediaBuffer::SetCurrentLength
+	comCall(pInputBuf, vtIMFMediaBufferSetCurrentLength, uintptr(inputSize))
 
 	// 3. Create Sample and attach buffer
 	var pInputSample uintptr
 	procMFCreateSample.Call(uintptr(unsafe.Pointer(&pInputSample)))
 	defer comRelease(pInputSample)
 
-	// IMFSample::AddBuffer (vtable index 42)
-	comCall(pInputSample, 42, pInputBuf)
+	// IMFSample::AddBuffer
+	comCall(pInputSample, vtIMFSampleAddBuffer, pInputBuf)
 
-	// IMFSample::SetSampleTime (vtable index 36)
+	// IMFSample::SetSampleTime
 	frameTimeHNS := pts.Nanoseconds() / 100
-	comCall(pInputSample, 36, uintptr(frameTimeHNS))
+	comCall(pInputSample, vtIMFSampleSetSampleTime, uintptr(frameTimeHNS))
 
-	// IMFSample::SetSampleDuration (vtable index 38)
+	// IMFSample::SetSampleDuration
 	frameDurationHNS := int64(time.Second/time.Duration(e.fps)) / 100
-	comCall(pInputSample, 38, uintptr(frameDurationHNS))
+	comCall(pInputSample, vtIMFSampleSetSampleDuration, uintptr(frameDurationHNS))
 
-	// 4. Send Sample to MFT: IMFTransform::ProcessInput (vtable index 23)
-	r = comCall(e.mft, 23, 0, pInputSample, 0)
+	// 4. Send Sample to MFT: IMFTransform::ProcessInput (vtable index 24)
+	r = comCall(e.mft, vtIMFTransformProcessInput, 0, pInputSample, 0)
 	if int32(r) < 0 {
 		return nil, false, fmt.Errorf("IMFTransform::ProcessInput failed: 0x%08X", r)
 	}
@@ -285,14 +342,14 @@ func (e *MFTEncoder) Encode(bgra []byte, pts time.Duration) ([][]byte, bool, err
 	procMFCreateSample.Call(uintptr(unsafe.Pointer(&pOutputSample)))
 	defer comRelease(pOutputSample)
 
-	comCall(pOutputSample, 42, pOutputBuf)
+	comCall(pOutputSample, vtIMFSampleAddBuffer, pOutputBuf)
 
 	var outputBuffer mftOutputDataBuffer
 	outputBuffer.pSample = pOutputSample
 
 	var status uint32
-	// IMFTransform::ProcessOutput (vtable index 24)
-	r = comCall(e.mft, 24, 0, 1, uintptr(unsafe.Pointer(&outputBuffer)), uintptr(unsafe.Pointer(&status)))
+	// IMFTransform::ProcessOutput (vtable index 25)
+	r = comCall(e.mft, vtIMFTransformProcessOutput, 0, 1, uintptr(unsafe.Pointer(&outputBuffer)), uintptr(unsafe.Pointer(&status)))
 
 	const MF_E_TRANSFORM_NEED_MORE_INPUT = 0xC00D6D9F
 	if uint32(r) == MF_E_TRANSFORM_NEED_MORE_INPUT {
@@ -303,16 +360,16 @@ func (e *MFTEncoder) Encode(bgra []byte, pts time.Duration) ([][]byte, bool, err
 	}
 
 	// 6. Extract Encoded Data
-	// IMFMediaBuffer::Lock (vtable index 3)
+	// IMFMediaBuffer::Lock
 	var pOutData uintptr
 	var outMax, outLen uint32
-	comCall(pOutputBuf, 3, uintptr(unsafe.Pointer(&pOutData)), uintptr(unsafe.Pointer(&outMax)), uintptr(unsafe.Pointer(&outLen)))
+	comCall(pOutputBuf, vtIMFMediaBufferLock, uintptr(unsafe.Pointer(&pOutData)), uintptr(unsafe.Pointer(&outMax)), uintptr(unsafe.Pointer(&outLen)))
 
 	outBytes := make([]byte, outLen)
 	if outLen > 0 {
 		copy(outBytes, unsafe.Slice((*byte)(unsafe.Pointer(pOutData)), outLen))
 	}
-	comCall(pOutputBuf, 4) // Unlock
+	comCall(pOutputBuf, vtIMFMediaBufferUnlock)
 
 	// 7. Split into Annex-B NALUs
 	nalus := SplitAnnexBNALUs(outBytes)
@@ -352,19 +409,30 @@ func (e *MFTEncoder) cleanupLocked() {
 	}
 }
 
+// IMFAttributes, in declaration order (own methods start at 3):
+// 3 GetItem, 4 GetItemType, 5 CompareItem, 6 Compare, 7 GetUINT32, 8 GetUINT64,
+// 9 GetDouble, 10 GetGUID, 11 GetStringLength, ..., 17 GetUnknown, 18 SetItem,
+// 19 DeleteItem, 20 SetUnknown, 21 SetUINT32, 22 SetUINT64, 23 SetDouble,
+// 24 SetGUID, 25 SetString
+const (
+	vtIMFAttributesSetUINT32 = 21
+	vtIMFAttributesSetUINT64 = 22
+	vtIMFAttributesSetGUID   = 24
+)
+
 func setGUID(pObj uintptr, key windows.GUID, val windows.GUID) {
-	// IMFAttributes::SetGUID (vtable index 24)
-	comCall(pObj, 24, uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&val)))
+	// IMFAttributes::SetGUID
+	comCall(pObj, vtIMFAttributesSetGUID, uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&val)))
 }
 
 func setUINT32(pObj uintptr, key windows.GUID, val uint32) {
-	// IMFAttributes::SetUINT32 (vtable index 21)
-	comCall(pObj, 21, uintptr(unsafe.Pointer(&key)), uintptr(val))
+	// IMFAttributes::SetUINT32
+	comCall(pObj, vtIMFAttributesSetUINT32, uintptr(unsafe.Pointer(&key)), uintptr(val))
 }
 
 func setUINT64(pObj uintptr, key windows.GUID, val uint64) {
-	// IMFAttributes::SetUINT64 (vtable index 22)
-	comCall(pObj, 22, uintptr(unsafe.Pointer(&key)), uintptr(val))
+	// IMFAttributes::SetUINT64
+	comCall(pObj, vtIMFAttributesSetUINT64, uintptr(unsafe.Pointer(&key)), uintptr(val))
 }
 
 func packUINT64(high, low uint32) uint64 {
