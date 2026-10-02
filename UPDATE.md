@@ -1,608 +1,116 @@
-FIX THE CURRENT REMOTE DESKTOP "REQUEST TIMED OUT" BUG AND THE SIGNALING PROTOCOL MISMATCH.
-
-I tested the latest main branch after the MsgAgentHello named-pipe fix.
-
-Current behavior:
-
-1. Click Remote Desktop.
-2. Click Allow Access.
-3. Remote Desktop view appears.
-4. PC briefly shows a busy/spinning cursor.
-5. The remote view remains black / does not become usable.
-6. After waiting, browser returns to Dashboard with:
-   "Failed to start remote desktop: Request timed out"
-
-I inspected the current codebase.
-
-The named-pipe handshake issue has already been fixed.
-Do NOT undo that fix.
-
-ROOT CAUSE #1:
-The Remote Desktop signaling request is asynchronous on the host, but the browser treats it as a normal request/response RPC.
-
-Current browser flow:
-
-sendRemoteSignal()
-    -> sendRequest('remote_signal', ...)
-    -> waits for matching request ID
-    -> timeout after 6500 ms
-
-Current protocol handler:
-
-case "remote_signal":
-    ...
-    replySig, err := rm.HandleSignaling(...)
-    ...
-    if replySig != nil {
-        return encrypted response...
-    }
-    return nil, nil // Asynchronous signaling will be emitted by worker
-
-Therefore the original request never receives a correlated response.
-
-The worker's answer is emitted asynchronously through the remote manager's outbound signaling callback, but that does NOT resolve the original pending request.
-
-This MUST be fixed.
-
-==================================================
-REQUIRED ARCHITECTURE
-==================================================
-
-Keep asynchronous WebRTC signaling.
-
-Do NOT force all signaling through a synchronous request/response model.
-
-The correct distinction is:
-
-REQUEST/RESPONSE:
-- remote_request
-- normal PC commands
-
-ASYNC SIGNALING:
-- offer
-- answer
-- ICE candidates
-- session close
-- signaling state
-
-The browser must NOT wait 6.5 seconds for an async signaling request to complete merely because the signaling message itself was accepted.
-
-==================================================
-PREFERRED FIX
-==================================================
-
-When the host successfully accepts/forwards a remote_signal message:
-
-return an IMMEDIATE correlated acknowledgment using the SAME request ID.
-
-For example:
-
-{
-    id: <original request ID>,
-    status: "ok",
-    message: "signaling forwarded"
-}
-
-The actual WebRTC answer/candidates remain asynchronous signaling messages.
-
-Therefore:
-
-remote_signal request
-    ->
-host validates
-    ->
-host forwards to session-agent
-    ->
-host immediately returns ACK
-    ->
-browser resolves sendRemoteSignal()
-    ->
-actual answer arrives separately through the existing async signaling path
-
-Do NOT block the HTTP/Nostr command request waiting for the WebRTC worker.
-
-Do NOT invent arbitrary fake timing.
-
-Do NOT increase the 6500 ms timeout as a workaround.
-
-==================================================
-PROTOCOL HANDLER CHANGE
-==================================================
-
-Inspect:
-
-internal/protocol/handler.go
-
-Current remote_signal branch:
-
-    replySig, err := rm.HandleSignaling(evt.PubKey, *cmd.Signal)
-
-If forwarding succeeds and replySig == nil, return a normal encrypted response packet:
-
-ResponsePacket{
-    ID:        cmd.ID,
-    Status:    "ok",
-    Message:   "signaling forwarded",
-    Timestamp: time.Now().Unix(),
-}
-
-This MUST be returned for successfully forwarded asynchronous signaling.
-
-If HandleSignaling returns an actual immediate reply signal:
-preserve that behavior and include Signal as before.
-
-If HandleSignaling fails:
-return the existing error response.
-
-Do not return nil,nil for a successfully forwarded command.
-
-This ensures the browser's pendingRequests entry resolves correctly.
-
-==================================================
-VERY IMPORTANT: FIX SIGNAL TYPE MISMATCH
-==================================================
-
-The Go canonical values in:
-
-internal/remote/session/types.go
-
-are:
-
-offer
-answer
-ice-candidate
-session-auth
-session-challenge
-session-accepted
-session-rejected
-session-close
-heartbeat
-error
-
-The browser currently sends/handles:
-
-candidate
-close
-
-This is inconsistent and must be corrected.
-
-Update the web client to use the exact canonical names.
-
-Browser -> host:
-- offer
-- ice-candidate
-- session-close
-- heartbeat
-
-Host -> browser:
-- answer
-- ice-candidate
-- session-close
-- error
-etc.
-
-Do NOT modify the Go protocol merely to accommodate the incorrect browser strings.
-
-Use the existing Go protocol as the canonical protocol definition.
-
-==================================================
-WEB CLIENT CHANGES
-==================================================
-
-Inspect:
-
-web/app.js
-
-Current code sends:
-
-type: 'candidate'
-
-Change this to:
-
-type: 'ice-candidate'
-
-Current code sends:
-
-type: 'close'
-
-Change this to:
-
-type: 'session-close'
-
-Current incoming handler currently checks:
-
-signal.type === 'candidate'
-
-Change to:
-
-signal.type === 'ice-candidate'
-
-Current incoming handler currently checks:
-
-signal.type === 'close'
-
-Change to:
-
-signal.type === 'session-close'
-
-Do not add duplicate aliases unless necessary for backwards compatibility with an already deployed version.
-
-The current protocol is still under active development, so use one canonical naming scheme.
-
-==================================================
-sendRemoteSignal() BEHAVIOR
-==================================================
-
-After the host starts returning the immediate ACK, update the browser code so that:
-
-async function sendRemoteSignal(sig)
-
-1. Sends remote_signal.
-2. Waits only for the immediate ACK.
-3. If ACK contains an actual response signal, process it.
-4. Otherwise simply return the ACK.
-
-Do NOT treat "no signal in ACK" as an error.
-
-The actual answer/ICE packets will arrive through the existing asynchronous remote signaling path.
-
-Example conceptual behavior:
-
-const res = await sendRequest('remote_signal', { signal: sig });
-
-if (res && res.signal) {
-    await handleIncomingRemoteSignal(res.signal);
-}
-
-return res;
-
-That part may already work once the host sends the ACK.
-
-==================================================
-ASYNC ANSWER PATH
-==================================================
-
-Preserve the current architecture where the worker sends:
-
-MsgSignalAgentToPhone
-
-and SessionManager.handleAgentMessage() calls:
-
-outboundSignal(phonePubKey, packet)
-
-and Daemon publishes the encrypted signaling response through Nostr.
-
-Do not remove this asynchronous path.
-
-Ensure that:
-
-- offer answer arrives asynchronously
-- browser processes it even though the original remote_signal ACK is separate
-- answer is matched to the active session ID
-- wrong-session packets are ignored
-- wrong-laptop packets are ignored
-- wrong-phone packets are ignored
-
-The browser's async signaling handler must continue to work without depending on the original request ID.
-
-==================================================
-LOCAL LAN PATH
-==================================================
-
-Inspect:
-
-internal/server/local_server.go
-
-and the current handling of ProcessCommandEvent() returning nil.
-
-Currently /api/control may encode a nil response.
-
-After this fix, remote_signal should return a real encrypted response event containing the ACK.
-
-Therefore direct LAN signaling must also return a valid encrypted response.
-
-Do not leave the LAN path returning JSON null for a successfully forwarded remote_signal.
-
-The same cryptographic response mechanism must be used as other commands.
-
-==================================================
-NOSTR PATH
-==================================================
-
-For remote/Nostr transport:
-
-The original remote_signal request must receive an encrypted ACK with the ORIGINAL request ID.
-
-The worker-generated async answer may remain a separate encrypted event.
-
-The browser must process both.
-
-Example:
-
-EVENT A:
-    request ID = req_123
-    action = remote_signal
-    signal = offer
-
-HOST RESPONSE A:
-    id = req_123
-    status = ok
-    message = signaling forwarded
-
-EVENT B:
-    id = sig_456
-    signal = answer
-
-Browser:
-    resolves pending req_123 from A
-    processes answer from B independently
-
-Do NOT attempt to make EVENT B have the original request ID unless you redesign the entire signaling correlation system intentionally.
-
-==================================================
-SESSION CLOSE
-==================================================
-
-The current browser sends "close", which the Go validator rejects.
-
-Correct it to "session-close".
-
-The server already understands:
-
-SignalSessionClose
-
-and:
-
-m.sm.Terminate(...)
-
-Make sure it is actually reached.
-
-After the browser exits Remote Desktop:
-- session-close reaches host
-- StateMachine terminates session
-- session manager cleans pipe/process
-- session-agent exits
-- WebRTC closes
-- capture closes
-- encoder closes
-
-No lingering worker should remain.
-
-==================================================
-IMPORTANT CLEANUP BUG TO REVIEW
-==================================================
-
-Inspect:
-
-internal/remote/manager.go
-
-Current HandleSessionRequest holds:
-
-m.mu.Lock()
-defer m.mu.Unlock()
-
-for the entire function, including:
-- spawning worker
-- waiting for pipe Accept()
-- waiting up to 5 seconds
-
-This is unnecessarily broad locking.
-
-Do NOT blindly rewrite it, but audit whether this lock can interact with:
-- cleanupActiveSession()
-- state machine termination callbacks
-- async signaling
-- worker disconnect callbacks
-
-Avoid holding SessionManager's global mutex while performing slow blocking operations.
-
-Refactor only if needed to prevent deadlocks/races.
-
-Use narrow critical sections.
-
-Do NOT change behavior unnecessarily.
-
-==================================================
-VERIFY WORKER STARTUP
-==================================================
-
-After the signaling fix, trace the full sequence:
-
-Browser:
-remote_request
-    ↓
-Host creates session
-    ↓
-session pipe created
-    ↓
-session-agent spawned
-    ↓
-agent hello
-    ↓
-Windows identity verified
-    ↓
-InitSession
-    ↓
-worker initializes
-    ↓
-browser sends offer
-    ↓
-host ACKs offer forwarding immediately
-    ↓
-worker receives offer
-    ↓
-worker creates answer
-    ↓
-host emits async answer
-    ↓
-browser receives answer
-    ↓
-ICE negotiation
-    ↓
-WebRTC connected
-    ↓
-DataChannels opened
-    ↓
-browser signs challenge
-    ↓
-worker verifies signature
-    ↓
-auth_success
-    ↓
-capture begins
-    ↓
-video appears
-
-Do not skip steps.
-
-==================================================
-DO NOT HIDE THE NEXT FAILURE
-==================================================
-
-The current timeout is masking later stages.
-
-After fixing the timeout, make logging detailed enough to determine exactly where the session gets stuck.
-
-Use sanitized logs such as:
-
-[RemoteMgr] Session X received offer
-[RemoteMgr] Session X forwarded offer to agent
-[RemoteMgr] Session X signaling ACK sent
-[Agent] Session X received offer
-[Agent] Session X generated answer
-[WebRTC] Session X connection state: connecting
-[WebRTC] Session X connection state: connected
-[WebRTC] Session X in-band authentication PASSED
-[Agent] Session X starting capture
-
-Do NOT log:
-- private keys
-- auth secrets
-- full SDP if it contains unnecessary sensitive/local network details
-- session secrets
-
-Session ID is acceptable.
-
-==================================================
-SECURITY
-==================================================
-
-Do NOT weaken any current security mechanism to fix this.
-
-Preserve:
-- cryptographic phone authorization
-- NIP-44
-- signed commands
-- replay protection
-- session ID validation
-- session authentication
-- Windows named-pipe identity verification
-- authorized SID restrictions
-- one-session limit
-- heartbeat timeout
-
-Do not use:
-- unauthenticated WebSockets
-- localhost TCP without authentication
-- plain passwords
-- client-supplied "trusted" flags
-
-==================================================
-TESTS
-==================================================
-
-Add regression tests for:
-
-1. remote_signal successful forwarding returns immediate ACK
-
-2. ACK preserves original request ID
-
-3. ACK status is "ok"
-
-4. worker-generated answer remains asynchronous
-
-5. canonical "ice-candidate" accepted
-
-6. "candidate" rejected
-
-7. canonical "session-close" accepted
-
-8. "close" rejected
-
-9. wrong session ID rejected
-
-10. wrong phone public key rejected
-
-11. session-close actually terminates active session
-
-12. browser no longer waits for 6.5-second timeout after successful signaling forwarding
-
-If possible, add a protocol-level integration test covering:
-
-remote_request
--> remote_signal offer
--> ACK
--> async answer
-
-==================================================
-REAL WINDOWS TEST
-==================================================
-
-After implementing:
-
-1. Build the application.
-2. Restart the Windows service.
-3. Open the web dashboard.
-4. Click Remote Desktop.
-5. Click Allow Access.
-6. Verify no "Request timed out".
-7. Verify the PC session-agent starts.
-8. Verify WebRTC answer arrives.
-9. Verify Remote Desktop remains open.
-10. Verify actual screen video appears.
-11. Verify authentication succeeds.
-12. Verify mouse input works.
-13. Exit Remote Desktop.
-14. Verify the session-agent process disappears.
-15. Verify service remains running normally.
-
-Also test:
-- same Wi-Fi
-- phone on mobile data if available
-
-==================================================
-PERFORMANCE
-==================================================
-
-Do not fix the problem by:
-- increasing request timeout
-- creating polling loops
-- repeatedly reconnecting WebRTC
-- spawning additional workers
-- duplicating PeerConnections
-
-Remote signaling messages are tiny and should remain low overhead.
-
-Keep exactly one Remote Desktop session.
-
-==================================================
-FINAL REPORT
-==================================================
-
-Report:
-
-- files changed
-- exact root cause
-- why the original request timed out
-- how the ACK/async signaling separation works
-- protocol names corrected
-- session-close behavior
-- tests passed
-- actual Windows result
-- whether real screen video appeared
-- whether WebRTC connected
-- whether in-band auth succeeded
-- whether mouse input worked
-- any remaining issue
-
-Do not call the feature complete until the real screen is visible and the session survives beyond the original request timeout.
+We now know the DXGI side is working and the remaining failure is Media Foundation encoder initialization:
+
+IMFTransform::SetOutputType(H264) failed: 0x80070057 (E_INVALIDARG)
+
+Stop doing one-HRESULT-at-a-time patching.
+
+Perform a complete audit of internal/remote/encoder/mft_windows.go against the actual Windows SDK/API documentation and fix the encoder implementation as a coherent unit.
+
+Requirements:
+
+1. Get the real Windows Media Foundation headers available locally:
+   mftransform.h
+   mfapi.h
+   mfidl.h
+   wmcodecdsp.h
+   and any related headers required.
+
+2. Verify mechanically, not from memory:
+   - CLSID_CMSH264EncoderMFT
+   - IID_IMFTransform
+   - every IMFTransform vtable index used
+   - every IMFMediaType/attribute interface vtable index used
+   - every MF_* attribute GUID
+   - every COM method signature
+   - every HRESULT/argument type
+
+3. Specifically verify the complete IMFTransform initialization sequence against Microsoft's H.264 encoder documentation.
+   Do not assume the current SetOutputType-first approach is correct.
+   Confirm the required order of:
+   - encoder property/ICodecAPI configuration
+   - SetOutputType
+   - input-type discovery/selection
+   - SetInputType
+   - streaming initialization
+
+4. Verify the output media type contains the required H.264 attributes:
+   MF_MT_MAJOR_TYPE = MFMediaType_Video
+   MF_MT_SUBTYPE = MFVideoFormat_H264
+   MF_MT_AVG_BITRATE
+   MF_MT_FRAME_RATE
+   MF_MT_FRAME_SIZE
+   MF_MT_INTERLACE_MODE
+   MF_MT_MPEG2_PROFILE
+
+   Keep MF_MT_MPEG2_LEVEL optional unless there is a documented reason to set it.
+
+5. Do not blindly hardcode a profile value.
+   Verify the exact Windows SDK constant/value for eAVEncH264VProfile_Base and use the documented value.
+
+6. Prefer querying the MFT for its available input/output types rather than assuming a hand-constructed type is accepted.
+   Use GetOutputAvailableType / GetInputAvailableType where appropriate and validate the actual returned media type before setting it.
+
+7. Audit ALL manual COM vtable calls in the encoder, not only SetOutputType.
+   This is the important part: we have already discovered multiple bad indices in this project.
+
+8. Add runtime diagnostics that enumerate the MFT's advertised input/output media types when negotiation fails:
+   - subtype
+   - width/height
+   - frame rate
+   - profile
+   - HRESULT
+   This should make future incompatibilities diagnosable without another blind patch.
+
+9. Add regression tests for every hardcoded GUID/index that can reasonably be tested.
+   Keep platform-specific runtime integration tests separate from pure unit tests.
+
+10. Preserve:
+   - pure Go / CGO_ENABLED=0 build
+   - single Windows executable
+   - current DXGI capture implementation
+   - Pion WebRTC architecture
+   - existing security and IPC architecture
+
+11. Do NOT replace the encoder with FFmpeg, x264, OpenH264, mediadevices, or another external codec dependency.
+
+12. Run:
+   go test ./...
+   go build -v -o bin\PC-Remote.exe .\cmd\laptopcontrol
+
+13. Do NOT push the changes yet.
+
+The goal is not "make this HRESULT go away".
+The goal is to make the Media Foundation encoder implementation correct against the actual Windows ABI/API and independently diagnosable.
+
+---
+
+## Resolution Summary: Complete Media Foundation Encoder Audit
+
+### Root Causes Discovered & Fixed
+1. **Corrupted GUIDs**:
+   - `guidMFMTMajorType` was `48eba18e-f827-4970-b450-cb99aa1522d7` instead of canonical `48eba18e-f8c9-4687-bf11-0a74c9f96a8f`.
+   - `guidMFMTInterlaceMode` was `e272446c-e767-4972-b012-18d5226f0e39` instead of canonical `e2724bb8-e676-4806-b4b2-a8d6efb44ccd`.
+   - Result: `SetOutputType(H264)` was failing with `0x80070057` (`E_INVALIDARG`) because `MF_MT_MAJOR_TYPE` and `MF_MT_INTERLACE_MODE` were never recognized by Media Foundation.
+2. **`IMFSample` Vtable Off-by-One**:
+   - `SetSampleTime` index was 37 instead of 36 (`37` is `GetSampleDuration`).
+   - `SetSampleDuration` index was 39 instead of 38 (`39` is `GetBufferCount`).
+3. **`MF_E_TRANSFORM_NEED_MORE_INPUT` Constant**:
+   - Was defined as `0xC00D6D9F` instead of `0xC00D6D72`.
+4. **Output Buffer Capacity**:
+   - Was hardcoded to `width * height` (921,600 bytes for 720p), which caused `0xC00D36B1` (`MF_E_BUFFERTOOSMALL`).
+   - Now dynamically queries `IMFTransform::GetOutputStreamInfo` (`streamInfo.cbSize` = 1,728,000 bytes).
+5. **Real-time Low Latency Mode**:
+   - Configured `CODECAPI_AVLowLatencyMode = VARIANT_TRUE` on `ICodecAPI`. Eliminates multi-frame buffering latency so frames output immediately starting from frame 0.
+6. **Dynamic Keyframe Generation**:
+   - Connected `RequestKeyFrame()` to `CODECAPI_AVEncVideoForceKeyFrame` via `ICodecAPI`.
+7. **Type Negotiation & Diagnostics**:
+   - Added prototype query via `GetOutputAvailableType(0, 0)`.
+   - Added `GetInputAvailableType` verification for NV12 support.
+   - Added `dumpMFTTypes` to log available input/output types on negotiation failure.
+
+### Tests & Build Status
+- `go test ./...` passed across all packages.
+- `TestMFT_GUIDsAgainstWindowsSDK`: PASSED (verified all GUIDs against official Windows SDK headers).
+- `TestMFT_VTableIndices`: PASSED (verified all vtable indices across `IMFTransform`, `ICodecAPI`, `IMFSample`, `IMFMediaBuffer`, `IMFAttributes`).
+- `TestMFT_EncoderInitAndEncodeLive`: PASSED (verified end-to-end H.264 live encoding, zero dropped frames, dynamic IDR keyframe production on request).
+- Built `bin\PC-Remote.exe` cleanly.

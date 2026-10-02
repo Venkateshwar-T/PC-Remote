@@ -7,7 +7,7 @@ import (
 
 var (
 	ErrEncoderUninitialized = errors.New("encoder is not initialized")
-	ErrInvalidDimensions   = errors.New("invalid video dimensions (must be positive even integers)")
+	ErrInvalidDimensions    = errors.New("invalid video dimensions (must be positive even integers)")
 )
 
 // VideoEncoder defines the interface for compressing raw frames into H.264 NALUs.
