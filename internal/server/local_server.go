@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/nbd-wtf/go-nostr"
 	"laptopcontrol/internal/config"
@@ -239,6 +241,7 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		lanStart := time.Now()
 		respEvt, errProc := s.handler.ProcessCommandEvent(&evt)
 		if errProc != nil {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -249,6 +252,7 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 		// Return the signed, NIP-44 encrypted response Nostr event
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(respEvt)
+		log.Printf("[RemoteReq Timing] response published via LAN HTTP (pipeline took %v)", time.Since(lanStart))
 		return
 	}
 

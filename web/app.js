@@ -783,13 +783,22 @@
     }
     const { reqId, signedEvt, convKey } = envelope;
 
+    const isRemoteReq = (action === 'remote_request');
+    const lanTimeoutMs = isRemoteReq ? 15000 : 1400;
+    const relayTimeoutMs = isRemoteReq ? 15000 : 6500;
+    const sendStartTime = Date.now();
+
+    if (isRemoteReq) {
+      console.log(`[RemoteReq Timing] [Req: ${reqId}] remote_request dispatched at ${new Date().toISOString()} (LAN timeout: ${lanTimeoutMs}ms, Relay timeout: ${relayTimeoutMs}ms)`);
+    }
+
     const canAttemptLan = !!config.lanHost;
 
     if (canAttemptLan) {
       const endpoint = `http://${config.lanHost}/api/control`;
       try {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 1400);
+        const timeoutId = setTimeout(() => controller.abort(), lanTimeoutMs);
 
         // POST ONLY the signed Nostr envelope! (Zero plaintext PIN!)
         const res = await fetch(endpoint, {
@@ -813,17 +822,29 @@
                 lastSeenTime = Date.now();
                 activeTransport = 'LOCAL';
                 setStatus('online', 'LOCAL');
+                if (isRemoteReq) {
+                  console.log(`[RemoteReq Timing] [Req: ${reqId}] remote_request succeeded via LAN in ${Date.now() - sendStartTime}ms`);
+                }
                 return data;
               }
             }
           } else if (respEvt && (respEvt.error || respEvt.status)) {
+            if (isRemoteReq) {
+              console.log(`[RemoteReq Timing] [Req: ${reqId}] remote_request error via LAN in ${Date.now() - sendStartTime}ms:`, respEvt);
+            }
             return respEvt;
           }
         } else if (res.status === 401 || res.status === 400 || res.status === 403) {
           const errData = await res.json();
+          if (isRemoteReq) {
+            console.log(`[RemoteReq Timing] [Req: ${reqId}] remote_request HTTP ${res.status} in ${Date.now() - sendStartTime}ms:`, errData);
+          }
           return errData;
         }
       } catch (e) {
+        if (isRemoteReq) {
+          console.log(`[RemoteReq Timing] [Req: ${reqId}] LAN attempt ended after ${Date.now() - sendStartTime}ms (${e.name === 'AbortError' ? 'timeout' : e.message}), falling back to Nostr relays`);
+        }
         // Fall through to Nostr relay pool
       }
     }
@@ -847,11 +868,23 @@
       const timer = setTimeout(() => {
         if (pendingRequests.has(reqId)) {
           pendingRequests.delete(reqId);
+          if (isRemoteReq) {
+            console.warn(`[RemoteReq Timing] [Req: ${reqId}] remote_request timed out on relays after ${Date.now() - sendStartTime}ms (limit: ${relayTimeoutMs}ms)`);
+          }
           reject(new Error('Request timed out'));
         }
-      }, 6500);
+      }, relayTimeoutMs);
 
-      pendingRequests.set(reqId, { resolve, reject, timer });
+      pendingRequests.set(reqId, {
+        resolve: (data) => {
+          if (isRemoteReq) {
+            console.log(`[RemoteReq Timing] [Req: ${reqId}] remote_request resolved via relay in ${Date.now() - sendStartTime}ms`);
+          }
+          resolve(data);
+        },
+        reject,
+        timer
+      });
     });
   }
 
@@ -1534,7 +1567,9 @@
       }
 
       // Step 1: Request session from service
+      const reqStart = Date.now();
       const res = await sendRequest('remote_request');
+      console.log(`[RemoteReq Timing] sendRequest('remote_request') completed in ${Date.now() - reqStart}ms, response status: ${res && res.status}`);
       if (!res || res.error || (res.status !== 'ready' && res.status !== 'accepted')) {
         const errMsg = (res && (res.error || res.message)) ? (res.error || res.message) : 'Session rejected by host';
         throw new Error(errMsg);

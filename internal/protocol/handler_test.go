@@ -261,7 +261,7 @@ type mockRemoteManager struct {
 	handleSignalingFunc func(phonePubKey string, packet session.SignalingPacket) (*session.SignalingPacket, error)
 }
 
-func (m *mockRemoteManager) HandleSessionRequest(phonePubKey string) (*session.SessionResponse, error) {
+func (m *mockRemoteManager) HandleSessionRequest(reqID, phonePubKey string) (*session.SessionResponse, error) {
 	return &session.SessionResponse{Status: "ready", SessionID: "sess-123"}, nil
 }
 
@@ -316,5 +316,42 @@ func TestProtocol_RemoteSignalImmediateAck(t *testing.T) {
 	}
 	if resp.Message != "signaling forwarded" {
 		t.Fatalf("expected message 'signaling forwarded', got %s", resp.Message)
+	}
+}
+
+func TestProtocol_RemoteRequestTiming(t *testing.T) {
+	cfg, _, _, handler := setupTestEnvironment(t)
+
+	clientPrivKey := nostr.GeneratePrivateKey()
+	clientPubKey, _ := nostr.GetPublicKey(clientPrivKey)
+	_ = cfg.AuthorizeDevice(clientPubKey, "Authorized Phone")
+
+	mockRM := &mockRemoteManager{}
+	handler.SetRemoteManager(mockRM)
+
+	cmd := CommandPacket{
+		ID:        "req-remotereq-001",
+		Action:    "remote_request",
+		Timestamp: time.Now().Unix(),
+	}
+	evt := createClientEvent(t, clientPrivKey, cfg.LaptopPubKey, cmd)
+
+	respEvt, err := handler.ProcessCommandEvent(evt)
+	if err != nil {
+		t.Fatalf("ProcessCommandEvent failed: %v", err)
+	}
+	if respEvt == nil {
+		t.Fatal("Expected response event for remote_request, got nil")
+	}
+
+	resp := decryptResponse(t, respEvt, clientPrivKey, cfg.LaptopPubKey)
+	if resp.ID != cmd.ID {
+		t.Fatalf("expected ID %s, got %s", cmd.ID, resp.ID)
+	}
+	if resp.Status != "ready" {
+		t.Fatalf("expected status ready, got %s", resp.Status)
+	}
+	if resp.SessionID != "sess-123" {
+		t.Fatalf("expected SessionID sess-123, got %s", resp.SessionID)
 	}
 }

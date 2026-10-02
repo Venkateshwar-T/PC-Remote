@@ -64,7 +64,7 @@ type ResponsePacket struct {
 
 // RemoteManagerInterface defines the interaction contract for Remote Desktop.
 type RemoteManagerInterface interface {
-	HandleSessionRequest(phonePubKey string) (*session.SessionResponse, error)
+	HandleSessionRequest(reqID, phonePubKey string) (*session.SessionResponse, error)
 	HandleSignaling(phonePubKey string, packet session.SignalingPacket) (*session.SignalingPacket, error)
 }
 
@@ -274,17 +274,20 @@ func (h *Handler) ProcessCommandEvent(evt *nostr.Event) (*nostr.Event, error) {
 		return h.BuildEncryptedResponse(evt.PubKey, cmd.ID, "error", "", "For security, Master PIN can only be changed directly on the PC desktop.", nil)
 
 	case "remote_request":
+		reqStart := time.Now()
+		log.Printf("[RemoteReq Timing] [Req: %s] remote_request received", cmd.ID)
 		h.mu.RLock()
 		rm := h.remoteMgr
 		h.mu.RUnlock()
 		if rm == nil {
 			return h.BuildEncryptedResponse(evt.PubKey, cmd.ID, "error", "", "Remote Desktop capability is uninitialized on host", nil)
 		}
-		resp, err := rm.HandleSessionRequest(evt.PubKey)
+		resp, err := rm.HandleSessionRequest(cmd.ID, evt.PubKey)
 		if err != nil {
+			log.Printf("[RemoteReq Timing] [Req: %s] HandleSessionRequest failed after %v: %v", cmd.ID, time.Since(reqStart), err)
 			return h.BuildEncryptedResponse(evt.PubKey, cmd.ID, "error", "", err.Error(), nil)
 		}
-		return h.BuildEncryptedResponsePacket(evt.PubKey, ResponsePacket{
+		respEvt, buildErr := h.BuildEncryptedResponsePacket(evt.PubKey, ResponsePacket{
 			ID:            cmd.ID,
 			Status:        resp.Status,
 			SessionID:     resp.SessionID,
@@ -292,6 +295,8 @@ func (h *Handler) ProcessCommandEvent(evt *nostr.Event) (*nostr.Event, error) {
 			Message:       resp.Message,
 			Timestamp:     time.Now().Unix(),
 		})
+		log.Printf("[RemoteReq Timing] [Req: %s] [Session: %s] response prepared (elapsed since receive: %v)", cmd.ID, resp.SessionID, time.Since(reqStart))
+		return respEvt, buildErr
 
 	case "remote_signal":
 		h.mu.RLock()

@@ -127,6 +127,7 @@ func (c *Client) HandleEvent(evt *nostr.Event) {
 		return
 	}
 
+	start := time.Now()
 	respEvt, err := c.handler.ProcessCommandEvent(evt)
 	if err != nil {
 		log.Printf("[Relay] Event %s dropped: %v", evt.ID, err)
@@ -137,7 +138,9 @@ func (c *Client) HandleEvent(evt *nostr.Event) {
 		return
 	}
 
+	pubStart := time.Now()
 	c.PublishEvent(respEvt)
+	log.Printf("[RemoteReq Timing] response published across relays (publish took %v, total pipeline: %v)", time.Since(pubStart), time.Since(start))
 }
 
 // PublishEvent publishes a prepared Nostr event across all configured relays concurrently.

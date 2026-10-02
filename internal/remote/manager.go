@@ -49,7 +49,8 @@ func (m *SessionManager) SetOutboundSignalHandler(fn func(phonePubKey string, pa
 }
 
 // HandleSessionRequest handles an incoming "remote_request" action from a paired phone.
-func (m *SessionManager) HandleSessionRequest(phonePubKey string) (*session.SessionResponse, error) {
+func (m *SessionManager) HandleSessionRequest(reqID, phonePubKey string) (*session.SessionResponse, error) {
+	reqStart := time.Now()
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -97,6 +98,7 @@ func (m *SessionManager) HandleSessionRequest(phonePubKey string) (*session.Sess
 
 	// 4. Spawn session-agent into active interactive console session
 	_ = m.sm.Transition(sessionID, session.StateLaunching)
+	spawnStart := time.Now()
 	procHandle, err := m.spawner.SpawnSessionAgent(sessionID, pipeName, authChallenge, phonePubKey)
 	if err != nil {
 		m.mu.Lock()
@@ -106,13 +108,14 @@ func (m *SessionManager) HandleSessionRequest(phonePubKey string) (*session.Sess
 		}
 		m.mu.Unlock()
 		_ = m.sm.Transition(sessionID, session.StateFailed)
-		log.Printf("[RemoteMgr] Failed to spawn session-agent: %v", err)
+		log.Printf("[RemoteReq Timing] [Req: %s] [Session: %s] Failed to spawn session-agent after %v: %v", reqID, sessionID, time.Since(spawnStart), err)
 		return &session.SessionResponse{
 			Status:    "error",
 			Message:   fmt.Sprintf("Failed to launch session worker in interactive desktop: %v", err),
 			Timestamp: time.Now().Unix(),
 		}, nil
 	}
+	log.Printf("[RemoteReq Timing] [Req: %s] [Session: %s] session-agent process spawned (took %v, elapsed: %v)", reqID, sessionID, time.Since(spawnStart), time.Since(reqStart))
 
 	m.mu.Lock()
 	m.activeProcess = procHandle
@@ -128,6 +131,9 @@ func (m *SessionManager) HandleSessionRequest(phonePubKey string) (*session.Sess
 	})
 
 	connectedChan := make(chan error, 1)
+	acceptStart := time.Now()
+	log.Printf("[RemoteReq Timing] [Req: %s] [Session: %s] pipe Accept started (pipe: %s, elapsed: %v)", reqID, sessionID, pipeName, time.Since(reqStart))
+
 	go func() {
 		connectedChan <- pipeServer.Accept()
 	}()
@@ -142,13 +148,14 @@ func (m *SessionManager) HandleSessionRequest(phonePubKey string) (*session.Sess
 			}
 			m.mu.Unlock()
 			_ = m.sm.Transition(sessionID, session.StateFailed)
-			log.Printf("[RemoteMgr] Session pipe accept failed for session %s: %v", sessionID, err)
+			log.Printf("[RemoteReq Timing] [Req: %s] [Session: %s] Session pipe accept failed after %v: %v", reqID, sessionID, time.Since(acceptStart), err)
 			return &session.SessionResponse{
 				Status:    "error",
 				Message:   fmt.Sprintf("Failed to establish pipe with session worker: %v", err),
 				Timestamp: time.Now().Unix(),
 			}, nil
 		}
+		log.Printf("[RemoteReq Timing] [Req: %s] [Session: %s] pipe connected (wait took %v, elapsed: %v)", reqID, sessionID, time.Since(acceptStart), time.Since(reqStart))
 	case <-time.After(5 * time.Second):
 		m.mu.Lock()
 		if m.activePipe == pipeServer {
@@ -157,7 +164,7 @@ func (m *SessionManager) HandleSessionRequest(phonePubKey string) (*session.Sess
 		}
 		m.mu.Unlock()
 		_ = m.sm.Transition(sessionID, session.StateFailed)
-		log.Printf("[RemoteMgr] Session agent launch timed out for session %s", sessionID)
+		log.Printf("[RemoteReq Timing] [Req: %s] [Session: %s] Session agent launch timed out after 5s (elapsed: %v)", reqID, sessionID, time.Since(reqStart))
 		return &session.SessionResponse{
 			Status:    "error",
 			Message:   "Session worker took too long to connect",
@@ -166,6 +173,7 @@ func (m *SessionManager) HandleSessionRequest(phonePubKey string) (*session.Sess
 	}
 
 	// Agent connected! Send bootstrap configuration
+	initStart := time.Now()
 	initPayload := remoteipc.InitSessionPayload{
 		AuthChallenge: authChallenge,
 		PhonePubKey:   phonePubKey,
@@ -176,7 +184,7 @@ func (m *SessionManager) HandleSessionRequest(phonePubKey string) (*session.Sess
 		UDPPort: 8765,
 	}
 	if err := pipeServer.Send(remoteipc.MsgInitSession, sessionID, initPayload); err != nil {
-		log.Printf("[RemoteMgr] Failed to send InitSession to agent: %v", err)
+		log.Printf("[RemoteReq Timing] [Req: %s] [Session: %s] Failed to send InitSession to agent after %v: %v", reqID, sessionID, time.Since(initStart), err)
 		m.mu.Lock()
 		if m.activePipe == pipeServer {
 			_ = pipeServer.Close()
@@ -190,8 +198,11 @@ func (m *SessionManager) HandleSessionRequest(phonePubKey string) (*session.Sess
 			Timestamp: time.Now().Unix(),
 		}, nil
 	}
+	log.Printf("[RemoteReq Timing] [Req: %s] [Session: %s] InitSession sent (took %v, elapsed: %v)", reqID, sessionID, time.Since(initStart), time.Since(reqStart))
 
 	_ = m.sm.Transition(sessionID, session.StateSignaling)
+
+	log.Printf("[RemoteReq Timing] [Req: %s] [Session: %s] HandleSessionRequest completed (status: ready, total elapsed: %v)", reqID, sessionID, time.Since(reqStart))
 
 	return &session.SessionResponse{
 		Status:        "ready",
