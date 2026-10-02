@@ -108,15 +108,7 @@ func (d *Daemon) Start() error {
 
 	// Wire outbound Remote Desktop WebRTC signaling publisher over Nostr relay pool
 	remoteMgr.SetOutboundSignalHandler(func(phonePubKey string, packet session.SignalingPacket) {
-		respEvt, err := protoHandler.BuildEncryptedResponsePacket(phonePubKey, protocol.ResponsePacket{
-			ID:        fmt.Sprintf("sig_%d", time.Now().UnixNano()),
-			Status:    "ok",
-			Signal:    &packet,
-			Timestamp: time.Now().Unix(),
-		})
-		if err == nil && respEvt != nil && d.relayClient != nil {
-			d.relayClient.PublishEvent(respEvt)
-		}
+		d.publishSignal(phonePubKey, packet)
 	})
 
 	// 7. Configure IPC Handlers for communication with interactive desktop tray
@@ -237,6 +229,23 @@ func (d *Daemon) Start() error {
 		win32.TrimProcessMemory()
 	}()
 	return nil
+}
+
+// publishSignal encrypts and publishes a Remote Desktop signaling packet to the paired phone.
+// Used both for normal WebRTC negotiation and for out-of-band failure notifications.
+func (d *Daemon) publishSignal(phonePubKey string, packet session.SignalingPacket) {
+	if d.proto == nil || d.relayClient == nil {
+		return
+	}
+	respEvt, err := d.proto.BuildEncryptedResponsePacket(phonePubKey, protocol.ResponsePacket{
+		ID:        fmt.Sprintf("sig_%d", time.Now().UnixNano()),
+		Status:    "ok",
+		Signal:    &packet,
+		Timestamp: time.Now().Unix(),
+	})
+	if err == nil && respEvt != nil {
+		d.relayClient.PublishEvent(respEvt)
+	}
 }
 
 // Stop cleanly flushes config and halts all listeners

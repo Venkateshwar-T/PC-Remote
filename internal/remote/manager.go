@@ -15,6 +15,9 @@ import (
 	"laptopcontrol/internal/remote/spawner"
 )
 
+// outboundSignal publishes a signaling packet back to the paired phone.
+type outboundSignalFn func(phonePubKey string, packet session.SignalingPacket)
+
 // SessionManager coordinates Remote Desktop session orchestration, worker lifecycle, and signaling.
 type SessionManager struct {
 	cfg            *config.Config
@@ -23,7 +26,7 @@ type SessionManager struct {
 	mu             sync.Mutex
 	activeProcess  *spawner.ProcessHandle
 	activePipe      *remoteipc.SessionPipeServer
-	outboundSignal  func(phonePubKey string, packet session.SignalingPacket)
+	outboundSignal  outboundSignalFn
 	lastWorkerError string
 	closed          bool
 }
@@ -44,7 +47,7 @@ func NewSessionManager(cfg *config.Config) *SessionManager {
 }
 
 // SetOutboundSignalHandler sets the callback to send signaling packets back to the phone.
-func (m *SessionManager) SetOutboundSignalHandler(fn func(phonePubKey string, packet session.SignalingPacket)) {
+func (m *SessionManager) SetOutboundSignalHandler(fn outboundSignalFn) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.outboundSignal = fn
@@ -388,7 +391,21 @@ func (m *SessionManager) handleAgentMessage(env *remoteipc.AgentEnvelope) {
 
 		m.mu.Lock()
 		m.lastWorkerError = errDesc
+		outCb := m.outboundSignal
 		m.mu.Unlock()
+
+		// Surface the failure to the phone. Without this the client sees a silent
+		// black screen when capture/encoder/WebRTC initialization fails on the host.
+		cur := m.sm.GetCurrentSession()
+		if cur != nil && cur.SessionID == env.SessionID && outCb != nil {
+			outCb(cur.PhonePubKey, session.SignalingPacket{
+				Type:      session.SignalError,
+				SessionID: env.SessionID,
+				Error:     errDesc,
+				Message:   "Remote desktop failed to start on the host",
+				Timestamp: time.Now().Unix(),
+			})
+		}
 
 		_ = m.sm.Transition(env.SessionID, session.StateFailed)
 

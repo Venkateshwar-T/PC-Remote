@@ -122,7 +122,9 @@
   let remoteControlDC = null;
   let remoteInputDC = null;
   let remotePingTimer = null;
+  let remoteConnectTimer = null;
   let isRemoteDesktopActive = false;
+  const REMOTE_CONNECT_TIMEOUT_MS = 20000;
 
   // Multi-Relay Pool (Public Nostr Relays)
   const RELAYS = [
@@ -1535,6 +1537,10 @@
             sdpMLineIndex: sdpMLineIndex
           }));
         }
+      } else if (signal.type === 'error') {
+        const detail = signal.error || signal.message || 'Remote desktop failed on the host';
+        showToast('Remote desktop error: ' + detail);
+        stopRemoteDesktopSession();
       } else if (signal.type === 'session-close' || signal.type === 'close') {
         showToast('Remote desktop ended by host');
         stopRemoteDesktopSession();
@@ -1548,6 +1554,24 @@
       await handleIncomingRemoteSignal(res.signal);
     }
     return res;
+  }
+
+  function clearRemoteConnectTimer() {
+    if (remoteConnectTimer) {
+      clearTimeout(remoteConnectTimer);
+      remoteConnectTimer = null;
+    }
+  }
+
+  // Fails the session with a visible error if the host never completes the
+  // WebRTC handshake, instead of leaving the user on an endless black screen.
+  function startRemoteConnectTimer() {
+    clearRemoteConnectTimer();
+    remoteConnectTimer = setTimeout(() => {
+      if (!isRemoteDesktopActive) return;
+      showToast('Connection timed out. The host did not start streaming.');
+      stopRemoteDesktopSession();
+    }, REMOTE_CONNECT_TIMEOUT_MS);
   }
 
   async function startRemoteDesktopSession() {
@@ -1587,6 +1611,7 @@
       remoteSessionId = res.sessionId;
       remoteAuthChallenge = res.authChallenge;
       remoteConnectingText.textContent = 'Establishing secure WebRTC connection...';
+      startRemoteConnectTimer();
 
       // Step 2: Configure WebRTC PeerConnection
       remoteRTC = new RTCPeerConnection({
@@ -1611,6 +1636,7 @@
         try {
           const msg = JSON.parse(e.data);
           if (msg.type === 'auth_success') {
+            clearRemoteConnectTimer();
             remoteConnectingOverlay.style.display = 'none';
             remoteTransportBadge.className = 'network-badge-dot pulse';
             remoteTransportLabel.textContent = activeTransport || 'CONNECTED';
@@ -1655,12 +1681,15 @@
       remoteRTC.onconnectionstatechange = () => {
         if (remoteRTC.connectionState === 'connected') {
           remoteTransportBadge.className = 'network-badge-dot pulse';
-        } else if (['failed', 'disconnected', 'closed'].includes(remoteRTC.connectionState)) {
+        } else if (remoteRTC.connectionState === 'failed' || remoteRTC.connectionState === 'closed') {
           if (isRemoteDesktopActive) {
             showToast('Remote desktop connection closed');
             stopRemoteDesktopSession();
           }
         }
+        // Note: 'disconnected' is intentionally NOT treated as fatal. It is
+        // frequently transient on mobile (network switch / brief loss) and
+        // WebRTC can recover on its own; only 'failed'/'closed' end the session.
       };
 
       // Step 3: Create offer and send signal
@@ -1684,6 +1713,7 @@
   function stopRemoteDesktopSession() {
     if (!isRemoteDesktopActive) return;
     isRemoteDesktopActive = false;
+    clearRemoteConnectTimer();
 
     if (remotePingTimer) {
       clearInterval(remotePingTimer);

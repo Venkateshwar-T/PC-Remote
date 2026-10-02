@@ -42,7 +42,16 @@ type SessionAgent struct {
 	mu         sync.Mutex
 	stopChan   chan struct{}
 	stopOnce   sync.Once
+
+	// pendingSignals buffers phone signaling that arrives before the WebRTC peer
+	// is initialized. The phone races ahead of us: it sends its offer as soon as
+	// the daemon reports "ready", which is before capture/encoder init completes.
+	// Dropping those packets silently caused a black screen with no error.
+	pendingSignals []session.SignalingPacket
+	peerReady      bool
 }
+
+const maxPendingSignals = 64
 
 // NewSessionAgent initializes the session-agent worker.
 func NewSessionAgent(cfg AgentConfig) *SessionAgent {
@@ -163,10 +172,13 @@ func (a *SessionAgent) Run() (err error) {
 		},
 	)
 
-	// 7. Background heartbeat to daemon
+	// 7. Peer is fully wired: replay any signaling that arrived during startup.
+	a.markPeerReady()
+
+	// 8. Background heartbeat to daemon
 	go a.heartbeatLoop()
 
-	// 8. Wait for termination or interrupt
+	// 9. Wait for termination or interrupt
 	var exitReason string
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -254,36 +266,81 @@ func (a *SessionAgent) handleDaemonMessage(env *remoteipc.AgentEnvelope, initCha
 			return
 		}
 
-		if pkt.Type == session.SignalOffer && a.peer != nil {
-			log.Printf("[Agent] Session %s received offer", a.cfg.SessionID)
-			// Process offer and generate answer
-			answerSDP, err := a.peer.HandleOffer(pkt.SDP)
-			if err != nil {
-				log.Printf("[Agent] Error handling offer: %v", err)
-				return
+		// If the WebRTC peer is not initialized yet, buffer the packet instead of
+		// dropping it. The phone reliably wins the race against capture/encoder init.
+		a.mu.Lock()
+		if !a.peerReady {
+			if len(a.pendingSignals) < maxPendingSignals {
+				a.pendingSignals = append(a.pendingSignals, pkt)
+				log.Printf("[Agent] Session %s buffered early %s (peer not ready, %d queued)", a.cfg.SessionID, pkt.Type, len(a.pendingSignals))
+			} else {
+				log.Printf("[Agent] Session %s dropping %s: signaling buffer full", a.cfg.SessionID, pkt.Type)
 			}
-			log.Printf("[Agent] Session %s generated answer", a.cfg.SessionID)
-
-			ansPkt := session.SignalingPacket{
-				Type:      session.SignalAnswer,
-				SessionID: a.cfg.SessionID,
-				SDP:       answerSDP,
-				Timestamp: time.Now().Unix(),
-			}
-			_ = a.pipeClient.Send(remoteipc.MsgSignalAgentToPhone, a.cfg.SessionID, ansPkt)
-
-		} else if (pkt.Type == session.SignalCandidate || pkt.Type == "candidate") && a.peer != nil && pkt.Candidate != nil {
-			log.Printf("[Agent] Session %s received ice-candidate", a.cfg.SessionID)
-			_ = a.peer.AddCandidate(*pkt.Candidate)
-
-		} else if pkt.Type == session.SignalSessionClose || pkt.Type == "close" {
-			log.Printf("[Agent] Session %s received session-close instruction from daemon", a.cfg.SessionID)
-			a.Stop()
+			a.mu.Unlock()
+			return
 		}
+		a.mu.Unlock()
+
+		a.processSignaling(pkt)
 
 	case remoteipc.MsgTerminate:
 		log.Printf("[Agent] Session %s received terminate instruction from daemon", a.cfg.SessionID)
 		a.Stop()
+	}
+}
+
+// processSignaling routes a single signaling packet to the WebRTC peer. Must only
+// be called once the peer has been initialized.
+func (a *SessionAgent) processSignaling(pkt session.SignalingPacket) {
+	if a.peer == nil {
+		return
+	}
+
+	switch pkt.Type {
+	case session.SignalOffer:
+		log.Printf("[Agent] Session %s received offer", a.cfg.SessionID)
+		answerSDP, err := a.peer.HandleOffer(pkt.SDP)
+		if err != nil {
+			log.Printf("[Agent] Error handling offer: %v", err)
+			return
+		}
+		log.Printf("[Agent] Session %s generated answer", a.cfg.SessionID)
+
+		ansPkt := session.SignalingPacket{
+			Type:      session.SignalAnswer,
+			SessionID: a.cfg.SessionID,
+			SDP:       answerSDP,
+			Timestamp: time.Now().Unix(),
+		}
+		_ = a.pipeClient.Send(remoteipc.MsgSignalAgentToPhone, a.cfg.SessionID, ansPkt)
+
+	case session.SignalCandidate:
+		if pkt.Candidate != nil {
+			log.Printf("[Agent] Session %s received ice-candidate", a.cfg.SessionID)
+			_ = a.peer.AddCandidate(*pkt.Candidate)
+		}
+
+	case session.SignalSessionClose:
+		log.Printf("[Agent] Session %s received session-close instruction from daemon", a.cfg.SessionID)
+		a.Stop()
+	}
+}
+
+// markPeerReady flips the peer-ready flag and replays any signaling packets that
+// arrived while we were still initializing capture/encoder/WebRTC.
+func (a *SessionAgent) markPeerReady() {
+	a.mu.Lock()
+	a.peerReady = true
+	pending := a.pendingSignals
+	a.pendingSignals = nil
+	a.mu.Unlock()
+
+	if len(pending) == 0 {
+		return
+	}
+	log.Printf("[Agent] Session %s replaying %d buffered signaling packet(s)", a.cfg.SessionID, len(pending))
+	for _, pkt := range pending {
+		a.processSignaling(pkt)
 	}
 }
 

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'pcremote-v7';
+const CACHE_NAME = 'pcremote-v8';
 const ASSETS = [
   './',
   './index.html',

@@ -89,6 +89,7 @@ type SignalingPacket struct {
 	Candidate *ICECandidate        `json:"candidate,omitempty"`
 	AuthData  string               `json:"authData,omitempty"`
 	Error     string               `json:"error,omitempty"`
+	Message   string               `json:"message,omitempty"`
 	Timestamp int64                `json:"timestamp"`
 }
 
