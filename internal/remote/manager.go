@@ -117,34 +117,62 @@ func (m *SessionManager) HandleSessionRequest(phonePubKey string) (*session.Sess
 		_ = m.sm.Transition(sessionID, session.StateStopped)
 	})
 
+	connectedChan := make(chan error, 1)
 	go func() {
-		if err := pipeServer.Accept(); err != nil {
-			log.Printf("[RemoteMgr] Session pipe accept failed for session %s: %v", sessionID, err)
-			_ = m.sm.Transition(sessionID, session.StateFailed)
-			return
-		}
-
-		// Agent connected! Send bootstrap configuration
-		initPayload := remoteipc.InitSessionPayload{
-			AuthChallenge: authChallenge,
-			PhonePubKey:   phonePubKey,
-			STUNServers: []string{
-				"stun:stun.l.google.com:19302",
-				"stun:stun1.l.google.com:19302",
-			},
-			UDPPort: 8765,
-		}
-		if err := pipeServer.Send(remoteipc.MsgInitSession, sessionID, initPayload); err != nil {
-			log.Printf("[RemoteMgr] Failed to send InitSession to agent: %v", err)
-			_ = m.sm.Transition(sessionID, session.StateFailed)
-			return
-		}
-
-		_ = m.sm.Transition(sessionID, session.StateSignaling)
+		connectedChan <- pipeServer.Accept()
 	}()
 
+	select {
+	case err := <-connectedChan:
+		if err != nil {
+			_ = pipeServer.Close()
+			m.activePipe = nil
+			_ = m.sm.Transition(sessionID, session.StateFailed)
+			log.Printf("[RemoteMgr] Session pipe accept failed for session %s: %v", sessionID, err)
+			return &session.SessionResponse{
+				Status:    "error",
+				Message:   fmt.Sprintf("Failed to establish pipe with session worker: %v", err),
+				Timestamp: time.Now().Unix(),
+			}, nil
+		}
+	case <-time.After(5 * time.Second):
+		_ = pipeServer.Close()
+		m.activePipe = nil
+		_ = m.sm.Transition(sessionID, session.StateFailed)
+		log.Printf("[RemoteMgr] Session agent launch timed out for session %s", sessionID)
+		return &session.SessionResponse{
+			Status:    "error",
+			Message:   "Session worker took too long to connect",
+			Timestamp: time.Now().Unix(),
+		}, nil
+	}
+
+	// Agent connected! Send bootstrap configuration
+	initPayload := remoteipc.InitSessionPayload{
+		AuthChallenge: authChallenge,
+		PhonePubKey:   phonePubKey,
+		STUNServers: []string{
+			"stun:stun.l.google.com:19302",
+			"stun:stun1.l.google.com:19302",
+		},
+		UDPPort: 8765,
+	}
+	if err := pipeServer.Send(remoteipc.MsgInitSession, sessionID, initPayload); err != nil {
+		log.Printf("[RemoteMgr] Failed to send InitSession to agent: %v", err)
+		_ = pipeServer.Close()
+		m.activePipe = nil
+		_ = m.sm.Transition(sessionID, session.StateFailed)
+		return &session.SessionResponse{
+			Status:    "error",
+			Message:   "Failed to initialize session worker",
+			Timestamp: time.Now().Unix(),
+		}, nil
+	}
+
+	_ = m.sm.Transition(sessionID, session.StateSignaling)
+
 	return &session.SessionResponse{
-		Status:        "accepted",
+		Status:        "ready",
 		SessionID:     sessionID,
 		AuthChallenge: authChallenge,
 		Message:       "Remote session initialized. Ready for WebRTC offer.",

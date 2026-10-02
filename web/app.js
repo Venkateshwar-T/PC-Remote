@@ -1535,7 +1535,7 @@
 
       // Step 1: Request session from service
       const res = await sendRequest('remote_request');
-      if (!res || res.error || res.status !== 'ready') {
+      if (!res || res.error || (res.status !== 'ready' && res.status !== 'accepted')) {
         const errMsg = (res && (res.error || res.message)) ? (res.error || res.message) : 'Session rejected by host';
         throw new Error(errMsg);
       }
