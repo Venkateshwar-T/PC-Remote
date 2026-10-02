@@ -1521,11 +1521,20 @@
           }));
         }
       } else if ((signal.type === 'ice-candidate' || signal.type === 'candidate') && signal.candidate) {
-        await remoteRTC.addIceCandidate(new RTCIceCandidate({
-          candidate: signal.candidate,
-          sdpMid: signal.sdpMid,
-          sdpMLineIndex: signal.sdpMLineIndex
-        }));
+        // Host (Go) sends candidates as a nested object {candidate, sdpMid, sdpMLineIndex};
+        // tolerate a flat string form too for backward compatibility.
+        const c = signal.candidate;
+        const isObj = (typeof c === 'object' && c !== null);
+        const candidateStr = isObj ? c.candidate : c;
+        const sdpMid = isObj ? c.sdpMid : signal.sdpMid;
+        const sdpMLineIndex = isObj ? c.sdpMLineIndex : signal.sdpMLineIndex;
+        if (candidateStr) {
+          await remoteRTC.addIceCandidate(new RTCIceCandidate({
+            candidate: candidateStr,
+            sdpMid: sdpMid,
+            sdpMLineIndex: sdpMLineIndex
+          }));
+        }
       } else if (signal.type === 'session-close' || signal.type === 'close') {
         showToast('Remote desktop ended by host');
         stopRemoteDesktopSession();
@@ -1575,8 +1584,8 @@
         throw new Error(errMsg);
       }
 
-      remoteSessionId = res.session_id;
-      remoteAuthChallenge = res.auth_challenge;
+      remoteSessionId = res.sessionId;
+      remoteAuthChallenge = res.authChallenge;
       remoteConnectingText.textContent = 'Establishing secure WebRTC connection...';
 
       // Step 2: Configure WebRTC PeerConnection
@@ -1632,11 +1641,13 @@
       remoteRTC.onicecandidate = (event) => {
         if (event.candidate && remoteSessionId) {
           sendRemoteSignal({
-            session_id: remoteSessionId,
+            sessionId: remoteSessionId,
             type: 'ice-candidate',
-            candidate: event.candidate.candidate,
-            sdpMid: event.candidate.sdpMid,
-            sdpMLineIndex: event.candidate.sdpMLineIndex
+            candidate: {
+              candidate: event.candidate.candidate,
+              sdpMid: event.candidate.sdpMid,
+              sdpMLineIndex: event.candidate.sdpMLineIndex
+            }
           }).catch(() => {});
         }
       };
@@ -1657,7 +1668,7 @@
       await remoteRTC.setLocalDescription(offer);
 
       const sigRes = await sendRemoteSignal({
-        session_id: remoteSessionId,
+        sessionId: remoteSessionId,
         type: 'offer',
         sdp: offer.sdp
       });
@@ -1681,7 +1692,7 @@
 
     if (remoteSessionId) {
       sendRemoteSignal({
-        session_id: remoteSessionId,
+        sessionId: remoteSessionId,
         type: 'session-close'
       }).catch(() => {});
     }
