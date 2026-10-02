@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"syscall"
 	"time"
 
 	"laptopcontrol/internal/config"
@@ -229,15 +230,27 @@ func (m *SessionManager) HandleSessionRequest(reqID, phonePubKey string) (*sessi
 				exitReason = fmt.Sprintf("worker process (PID %d) exited with code %d (0x%X), write error: %v", activeProc.PID(), code, code, err)
 			}
 		}
-		log.Printf("[RemoteMgr] [Req: %s] [Session: %s] InitSession send failed after %v: %v", reqID, sessionID, time.Since(initStart), err)
+
+		var sysErr syscall.Errno
+		var winErrStr string
+		if errors.As(err, &sysErr) {
+			winErrStr = fmt.Sprintf(" (Win32 error: %d / 0x%X)", uint32(sysErr), uint32(sysErr))
+		}
+
+		log.Printf("[RemoteMgr] [Req: %s] [Session: %s] InitSession send failed after %v: %v%s", reqID, sessionID, time.Since(initStart), err, winErrStr)
 		log.Printf("[RemoteMgr] [Req: %s] [Session: %s] worker exited, exit reason: %s", reqID, sessionID, exitReason)
 		return &session.SessionResponse{
 			Status:    "error",
-			Message:   fmt.Sprintf("Failed to initialize session worker: %v", err),
+			Message:   fmt.Sprintf("Failed to initialize session worker: %v%s", err, winErrStr),
 			Timestamp: time.Now().Unix(),
 		}, nil
 	}
 	log.Printf("[RemoteMgr] [Req: %s] [Session: %s] InitSession send succeeded (took %v, elapsed: %v)", reqID, sessionID, time.Since(initStart), time.Since(reqStart))
+
+	// 6. Start server background reader loop now that InitSession bootstrap has been sent
+	if err := pipeServer.StartReadLoop(); err != nil {
+		log.Printf("[RemoteMgr] [Req: %s] [Session: %s] Failed to start pipe server read loop: %v", reqID, sessionID, err)
+	}
 
 	_ = m.sm.Transition(sessionID, session.StateSignaling)
 

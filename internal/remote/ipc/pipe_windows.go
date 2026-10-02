@@ -12,9 +12,33 @@ import (
 	"net"
 	"sync"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
 
 	rootipc "laptopcontrol/internal/ipc"
 )
+
+var (
+	modKernel32       = windows.NewLazySystemDLL("kernel32.dll")
+	procPeekNamedPipe = modKernel32.NewProc("PeekNamedPipe")
+)
+
+func peekNamedPipeAvail(h windows.Handle) (uint32, error) {
+	var avail uint32
+	r1, _, err := procPeekNamedPipe.Call(
+		uintptr(h),
+		0,
+		0,
+		0,
+		uintptr(unsafe.Pointer(&avail)),
+		0,
+	)
+	if r1 == 0 {
+		return 0, err
+	}
+	return avail, nil
+}
 
 // SessionPipeServer manages the daemon side of the session named pipe.
 type SessionPipeServer struct {
@@ -26,6 +50,7 @@ type SessionPipeServer struct {
 	reader         *bufio.Reader
 	mu             sync.Mutex
 	closed         bool
+	readStarted    bool
 	onMessage      func(env *AgentEnvelope)
 	onClientClosed func()
 }
@@ -128,11 +153,30 @@ func (s *SessionPipeServer) Accept() error {
 		return fmt.Errorf("unauthorized process (SID %s) connected to session pipe", ident.SID)
 	}
 
-	// Store connection and EXACT SAME buffered reader, then launch background readLoop
+	// Store connection and EXACT SAME buffered reader.
+	// Note: readLoop is NOT started here; StartReadLoop() must be called
+	// after InitSession is transmitted to ensure deterministic bootstrap.
 	s.mu.Lock()
 	s.conn = conn
 	s.reader = reader
 	s.mu.Unlock()
+
+	return nil
+}
+
+// StartReadLoop initiates the background reader goroutine for the server.
+// It should be called after InitSession has been transmitted to ensure deterministic bootstrap.
+func (s *SessionPipeServer) StartReadLoop() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed || s.conn == nil {
+		return errors.New("agent not connected to session pipe")
+	}
+	if s.readStarted {
+		return errors.New("read loop already started")
+	}
+	s.readStarted = true
 
 	go s.readLoop()
 	return nil
@@ -170,16 +214,28 @@ func (s *SessionPipeServer) readLoop() {
 	for {
 		s.mu.Lock()
 		reader := s.reader
+		conn := s.conn
 		closed := s.closed
 		s.mu.Unlock()
 
-		if closed || reader == nil {
+		if closed || reader == nil || conn == nil {
 			return
+		}
+
+		if reader.Buffered() == 0 {
+			avail, err := peekNamedPipeAvail(conn.Handle())
+			if err != nil {
+				return
+			}
+			if avail == 0 {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
 		}
 
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
-			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && !errors.Is(err, windows.ERROR_BROKEN_PIPE) {
 				log.Printf("[SessionPipe] Read error: %v", err)
 			}
 			return
@@ -314,11 +370,23 @@ func (c *SessionPipeClient) readLoop() {
 	for {
 		c.mu.Lock()
 		reader := c.reader
+		conn := c.conn
 		closed := c.closed
 		c.mu.Unlock()
 
-		if closed || reader == nil {
+		if closed || reader == nil || conn == nil {
 			return
+		}
+
+		if reader.Buffered() == 0 {
+			avail, err := peekNamedPipeAvail(conn.Handle())
+			if err != nil {
+				return
+			}
+			if avail == 0 {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
 		}
 
 		line, err := reader.ReadBytes('\n')

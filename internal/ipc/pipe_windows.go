@@ -223,8 +223,8 @@ func (l *PipeListener) Accept() (*PipeConn, error) {
 
 		hPipe, err := windows.CreateNamedPipe(
 			l.namePtr,
-			windows.PIPE_ACCESS_DUPLEX|windows.FILE_FLAG_OVERLAPPED,
-			windows.PIPE_TYPE_BYTE|windows.PIPE_READMODE_BYTE|windows.PIPE_WAIT|windows.PIPE_REJECT_REMOTE_CLIENTS,
+			windows.PIPE_ACCESS_DUPLEX,
+			windows.PIPE_TYPE_MESSAGE|windows.PIPE_READMODE_MESSAGE|windows.PIPE_WAIT|windows.PIPE_REJECT_REMOTE_CLIENTS,
 			windows.PIPE_UNLIMITED_INSTANCES,
 			65536,
 			65536,
@@ -238,29 +238,11 @@ func (l *PipeListener) Accept() (*PipeConn, error) {
 		l.curHandle = hPipe
 		l.mu.Unlock()
 
-		hEvent, err := windows.CreateEvent(nil, 1, 0, nil)
-		if err != nil {
-			_ = windows.CloseHandle(hPipe)
-			return nil, fmt.Errorf("CreateEvent failed: %w", err)
-		}
-
-		var o windows.Overlapped
-		o.HEvent = hEvent
-
 		// Wait for client connection
-		connErr := windows.ConnectNamedPipe(hPipe, &o)
+		connErr := windows.ConnectNamedPipe(hPipe, nil)
 		if connErr == windows.ERROR_PIPE_CONNECTED {
 			connErr = nil
-		} else if connErr == windows.ERROR_IO_PENDING {
-			_, waitErr := windows.WaitForSingleObject(hEvent, windows.INFINITE)
-			if waitErr != nil {
-				connErr = waitErr
-			} else {
-				var bytesTransferred uint32
-				connErr = windows.GetOverlappedResult(hPipe, &o, &bytesTransferred, false)
-			}
 		}
-		_ = windows.CloseHandle(hEvent)
 
 		l.mu.Lock()
 		if l.closed {
@@ -307,7 +289,7 @@ func (l *PipeListener) Close() error {
 		0,
 		nil,
 		windows.OPEN_EXISTING,
-		windows.FILE_FLAG_OVERLAPPED,
+		0,
 		0,
 	)
 	if err == nil {
@@ -332,7 +314,7 @@ func Dial(pipeName string, timeout time.Duration) (*PipeConn, error) {
 			0,
 			nil,
 			windows.OPEN_EXISTING,
-			windows.FILE_FLAG_OVERLAPPED,
+			0,
 			0,
 		)
 		if err == nil {

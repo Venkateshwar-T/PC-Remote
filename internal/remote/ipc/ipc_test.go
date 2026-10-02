@@ -251,6 +251,10 @@ func TestSessionPipe_WindowsIntegration(t *testing.T) {
 		t.Fatalf("server.Send(MsgInitSession) failed: %v", err)
 	}
 
+	if err := server.StartReadLoop(); err != nil {
+		t.Fatalf("server.StartReadLoop failed: %v", err)
+	}
+
 	select {
 	case env := <-receivedInit:
 		if env.SessionID != sessionID {
@@ -258,6 +262,93 @@ func TestSessionPipe_WindowsIntegration(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatalf("timeout waiting for client to receive MsgInitSession")
+	}
+}
+
+func TestSessionPipe_DeterministicSequence(t *testing.T) {
+	// Tests exact sequence required by Requirement 6 & 7:
+	// worker connects -> worker sends AgentHello -> server validates hello
+	// -> server verifies identity -> worker callback installed -> worker StartReadLoop()
+	// -> server sends InitSession -> server StartReadLoop() -> worker receives InitSession
+	pipeName := fmt.Sprintf(`\\.\pipe\PCRemote_Session_Deterministic_%d`, time.Now().UnixNano())
+	sessionID := "test_session_deterministic"
+
+	server, err := NewSessionPipeServer(pipeName, sessionID, "")
+	if err != nil {
+		t.Skipf("Skipping integration test: %v", err)
+		return
+	}
+	defer server.Close()
+
+	acceptDone := make(chan error, 1)
+	go func() {
+		acceptDone <- server.Accept()
+	}()
+
+	// 1. Worker connects and sends AgentHello (inside ConnectSessionPipe)
+	client, err := ConnectSessionPipe(pipeName, sessionID, 3*time.Second)
+	if err != nil {
+		t.Fatalf("ConnectSessionPipe failed: %v", err)
+	}
+	defer client.Close()
+
+	// 2. Server validates hello and verifies identity (completes Accept)
+	select {
+	case err := <-acceptDone:
+		if err != nil {
+			t.Fatalf("server.Accept() failed: %v", err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatalf("timeout waiting for server.Accept()")
+	}
+
+	// 3. Worker callback installed
+	receivedInit := make(chan *AgentEnvelope, 1)
+	client.SetOnMessage(func(env *AgentEnvelope) {
+		if env.Type == MsgInitSession {
+			receivedInit <- env
+		}
+	})
+
+	// 4. Worker StartReadLoop()
+	if err := client.StartReadLoop(); err != nil {
+		t.Fatalf("client.StartReadLoop failed: %v", err)
+	}
+
+	// 5. Server sends InitSession
+	initPayload := InitSessionPayload{
+		AuthChallenge: "seq_test_challenge_123",
+		PhonePubKey:   "seq_test_phone_key_456",
+		UDPPort:       8765,
+	}
+	err = server.Send(MsgInitSession, sessionID, initPayload)
+	if err != nil {
+		t.Fatalf("server.Send(MsgInitSession) failed: %v", err)
+	}
+
+	// 6. Server StartReadLoop()
+	if err := server.StartReadLoop(); err != nil {
+		t.Fatalf("server.StartReadLoop failed: %v", err)
+	}
+
+	// 7. Worker receives InitSession
+	select {
+	case env := <-receivedInit:
+		if env.SessionID != sessionID {
+			t.Fatalf("expected session ID %s, got %s", sessionID, env.SessionID)
+		}
+		var decoded InitSessionPayload
+		if err := json.Unmarshal(env.Payload, &decoded); err != nil {
+			t.Fatalf("failed to decode payload: %v", err)
+		}
+		if decoded.AuthChallenge != "seq_test_challenge_123" {
+			t.Fatalf("expected challenge seq_test_challenge_123, got %s", decoded.AuthChallenge)
+		}
+		if decoded.UDPPort != 8765 {
+			t.Fatalf("expected UDP port 8765, got %d", decoded.UDPPort)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timeout: worker did not receive MsgInitSession")
 	}
 }
 
@@ -306,6 +397,10 @@ func TestSessionPipe_InitSessionDeliveryWithDeferredReadLoop(t *testing.T) {
 	err = server.Send(MsgInitSession, sessionID, initPayload)
 	if err != nil {
 		t.Fatalf("server.Send(MsgInitSession) failed: %v", err)
+	}
+
+	if err := server.StartReadLoop(); err != nil {
+		t.Fatalf("server.StartReadLoop failed: %v", err)
 	}
 
 	// Now register callback on client

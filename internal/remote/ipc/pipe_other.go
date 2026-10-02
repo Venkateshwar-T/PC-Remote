@@ -18,6 +18,7 @@ func (s *SessionPipeServer) Accept() error                            { return e
 func (s *SessionPipeServer) Send(msgType AgentMessageType, sessionID string, payload interface{}) error {
 	return errors.New("not supported")
 }
+func (s *SessionPipeServer) StartReadLoop() error { return errors.New("not supported") }
 func (s *SessionPipeServer) Close() error { return nil }
 
 type SessionPipeClient struct{}
