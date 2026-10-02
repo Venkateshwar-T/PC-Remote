@@ -198,6 +198,27 @@
         </div>
       </section>
 
+      <!-- Remote Control -->
+      <section class="section-card">
+        <div class="section-title">Remote Control</div>
+        <div class="controls-list">
+          <button class="btn-control" id="btnOpenRemoteDesktop">
+            <div class="control-left">
+              <svg class="control-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="2" y="3" width="20" height="14" rx="2"/>
+                <line x1="8" y1="21" x2="16" y2="21"/>
+                <line x1="12" y1="17" x2="12" y2="21"/>
+              </svg>
+              <div class="control-text">
+                <span class="control-name">Remote Desktop</span>
+                <span class="control-desc">View screen and control mouse live</span>
+              </div>
+            </div>
+            <svg class="control-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+          </button>
+        </div>
+      </section>
+
       <!-- Power Controls -->
       <section class="section-card">
         <div class="section-title">Power Controls</div>
@@ -265,6 +286,104 @@
         </div>
       </section>
 
+    <!-- Remote Desktop View (starts display: none) -->
+    <div id="remoteDesktopView" class="remote-desktop-view" style="display: none;">
+      <!-- Portrait Top Header -->
+      <header class="remote-header" id="remoteHeader">
+        <button class="btn-remote-back" id="btnRemoteBack" aria-label="Exit Remote Desktop">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="15 18 9 12 15 6"/>
+          </svg>
+          <span>Exit</span>
+        </button>
+        <div class="remote-header-center">
+          <div class="remote-transport-badge" id="remoteTransportBadge">
+            <span class="status-dot"></span>
+            <span id="remoteTransportLabel">CONNECTING</span>
+          </div>
+        </div>
+        <div class="remote-header-right">
+          <button class="btn-orientation-toggle" id="btnToggleOrientation" aria-label="Toggle Landscape Orientation">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="2" y="6" width="20" height="12" rx="2"/>
+            </svg>
+          </button>
+          <div class="remote-battery" id="remoteBatteryText">--%</div>
+        </div>
+      </header>
+
+      <!-- Video Stream Container -->
+      <div class="remote-screen-container" id="remoteScreenContainer">
+        <video id="remoteVideo" autoplay playsinline muted></video>
+        <div class="remote-connecting-overlay" id="remoteConnectingOverlay">
+          <div class="remote-spinner"></div>
+          <div class="remote-connecting-text" id="remoteConnectingText">Connecting to PC screen...</div>
+        </div>
+      </div>
+
+      <!-- Portrait Touchpad Area (Relative Trackpad) -->
+      <div class="remote-touchpad-area" id="remoteTouchpadArea">
+        <div class="touchpad-grid-guide"></div>
+        <div class="touchpad-hint">1-finger drag: move &bull; tap: left click &bull; hold: right click &bull; 2-finger: scroll</div>
+      </div>
+
+      <!-- Floating Quick Actions Button -->
+      <button class="btn-floating-quick" id="btnFloatingQuick" aria-label="Quick power controls">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>
+          <line x1="12" y1="2" x2="12" y2="12"/>
+        </svg>
+      </button>
+
+      <!-- Quick Actions Popover Sheet -->
+      <div class="quick-actions-sheet" id="quickActionsSheet" style="display: none;">
+        <div class="quick-actions-header">Quick Power Controls</div>
+        <div class="quick-actions-grid">
+          <button class="quick-act-btn" id="btnQuickLock">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+              <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            </svg>
+            <span>Lock</span>
+          </button>
+          <button class="quick-act-btn" id="btnQuickSleep">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+            </svg>
+            <span>Sleep</span>
+          </button>
+          <button class="quick-act-btn" id="btnQuickRestart">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="23 4 23 10 17 10"/>
+              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+            </svg>
+            <span>Restart</span>
+          </button>
+          <button class="quick-act-btn danger" id="btnQuickShutdown">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>
+              <line x1="12" y1="2" x2="12" y2="12"/>
+            </svg>
+            <span>Shut Down</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    </div>
+  </div>
+
+  <!-- Remote Desktop Consent Modal -->
+  <div class="modal-overlay" id="remoteConsentModal" style="display: none;">
+    <div class="modal-box">
+      <div class="modal-header">Allow Remote Desktop Access?</div>
+      <div class="modal-desc">
+        Starting Remote Desktop will stream your PC screen live to this phone and permit direct mouse control and gestures.
+      </div>
+      <div class="modal-actions">
+        <button class="btn-modal btn-cancel" id="btnCancelRemoteConsent">Cancel</button>
+        <button class="btn-modal confirm-primary" id="btnConfirmRemoteConsent">Allow Access</button>
+      </div>
     </div>
   </div>
 

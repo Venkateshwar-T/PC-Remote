@@ -89,6 +89,41 @@
   const btnStateDismiss = document.getElementById('btnStateDismiss');
   let reconnectTimer = null;
 
+  // Remote Desktop View & Controls
+  const btnOpenRemoteDesktop = document.getElementById('btnOpenRemoteDesktop');
+  const remoteConsentModal = document.getElementById('remoteConsentModal');
+  const btnCancelRemoteConsent = document.getElementById('btnCancelRemoteConsent');
+  const btnConfirmRemoteConsent = document.getElementById('btnConfirmRemoteConsent');
+
+  const remoteDesktopView = document.getElementById('remoteDesktopView');
+  const remoteHeader = document.getElementById('remoteHeader');
+  const btnRemoteBack = document.getElementById('btnRemoteBack');
+  const btnToggleOrientation = document.getElementById('btnToggleOrientation');
+  const remoteTransportBadge = document.getElementById('remoteTransportBadge');
+  const remoteTransportLabel = document.getElementById('remoteTransportLabel');
+  const remoteBatteryText = document.getElementById('remoteBatteryText');
+
+  const remoteScreenContainer = document.getElementById('remoteScreenContainer');
+  const remoteVideo = document.getElementById('remoteVideo');
+  const remoteConnectingOverlay = document.getElementById('remoteConnectingOverlay');
+  const remoteConnectingText = document.getElementById('remoteConnectingText');
+  const remoteTouchpadArea = document.getElementById('remoteTouchpadArea');
+
+  const btnFloatingQuick = document.getElementById('btnFloatingQuick');
+  const quickActionsSheet = document.getElementById('quickActionsSheet');
+  const btnQuickLock = document.getElementById('btnQuickLock');
+  const btnQuickSleep = document.getElementById('btnQuickSleep');
+  const btnQuickRestart = document.getElementById('btnQuickRestart');
+  const btnQuickShutdown = document.getElementById('btnQuickShutdown');
+
+  let remoteSessionId = null;
+  let remoteAuthChallenge = null;
+  let remoteRTC = null;
+  let remoteControlDC = null;
+  let remoteInputDC = null;
+  let remotePingTimer = null;
+  let isRemoteDesktopActive = false;
+
   // Multi-Relay Pool (Public Nostr Relays)
   const RELAYS = [
     'wss://relay.damus.io',
@@ -492,6 +527,9 @@
 
   // State Machine Evaluator
   async function evaluateInitialState() {
+    if (remoteDesktopView) remoteDesktopView.style.display = 'none';
+    if (remoteConsentModal) remoteConsentModal.style.display = 'none';
+
     // 1. Inspect URL Fragment first
     const hash = window.location.hash.substring(1);
     let urlPair = null;
@@ -683,6 +721,9 @@
 
     try {
       const data = JSON.parse(plaintext);
+      if (data && data.signal && isRemoteDesktopActive) {
+        handleIncomingRemoteSignal(data.signal);
+      }
       if (data && data.id && pendingRequests.has(data.id)) {
         const { resolve, timer } = pendingRequests.get(data.id);
         clearTimeout(timer);
@@ -1319,6 +1360,755 @@
       pendingAction = null;
     }
   });
+
+  // ==================================================
+  // Remote Desktop Client Logic
+  // ==================================================
+  const GESTURE_CONFIG = {
+    TAP_MAX_DURATION_MS: 250,
+    LONG_PRESS_DURATION_MS: 500,
+    MOVE_TOLERANCE_PX: 8,
+    POINTER_SENSITIVITY: 1.25,
+    SCROLL_SENSITIVITY: 1.5,
+    TWO_FINGER_TAP_MAX_DURATION_MS: 300,
+  };
+
+  let pendingDX = 0;
+  let pendingDY = 0;
+  let rAFScheduled = false;
+
+  let latestAbsX = null;
+  let latestAbsY = null;
+  let rAFAbsScheduled = false;
+
+  function sendControlMessage(msg) {
+    if (remoteControlDC && remoteControlDC.readyState === 'open') {
+      try {
+        remoteControlDC.send(JSON.stringify(msg));
+      } catch (err) {}
+    }
+  }
+
+  function sendInputMessage(msg) {
+    if (remoteInputDC && remoteInputDC.readyState === 'open') {
+      try {
+        remoteInputDC.send(JSON.stringify(msg));
+      } catch (err) {}
+    } else if (remoteControlDC && remoteControlDC.readyState === 'open') {
+      try {
+        remoteControlDC.send(JSON.stringify(msg));
+      } catch (err) {}
+    }
+  }
+
+  function queueRelativeMove(dx, dy) {
+    pendingDX += dx;
+    pendingDY += dy;
+    if (!rAFScheduled) {
+      rAFScheduled = true;
+      requestAnimationFrame(() => {
+        rAFScheduled = false;
+        if (Math.abs(pendingDX) > 0.01 || Math.abs(pendingDY) > 0.01) {
+          sendInputMessage({
+            type: 'mouse_move',
+            mode: 'relative',
+            dx: Math.round(pendingDX),
+            dy: Math.round(pendingDY)
+          });
+          pendingDX = 0;
+          pendingDY = 0;
+        }
+      });
+    }
+  }
+
+  function queueAbsoluteMove(x, y) {
+    latestAbsX = x;
+    latestAbsY = y;
+    if (!rAFAbsScheduled) {
+      rAFAbsScheduled = true;
+      requestAnimationFrame(() => {
+        rAFAbsScheduled = false;
+        if (latestAbsX !== null && latestAbsY !== null) {
+          sendInputMessage({
+            type: 'mouse_move',
+            mode: 'absolute',
+            x: Math.round(latestAbsX * 10000) / 10000,
+            y: Math.round(latestAbsY * 10000) / 10000
+          });
+          latestAbsX = null;
+          latestAbsY = null;
+        }
+      });
+    }
+  }
+
+  function sendInBandAuth() {
+    if (!remoteControlDC || remoteControlDC.readyState !== 'open' || !remoteAuthChallenge) {
+      return;
+    }
+    try {
+      const created_at = Math.floor(Date.now() / 1000);
+      const evtTemplate = {
+        kind: 28000,
+        created_at: created_at,
+        tags: [],
+        content: remoteAuthChallenge
+      };
+      const skBytes = NostrTools.utils.hexToBytes(config.phonePrivkey);
+      const signedEvt = NostrTools.finalizeEvent(evtTemplate, skBytes);
+      remoteControlDC.send(JSON.stringify({
+        type: 'auth',
+        token: remoteAuthChallenge,
+        created_at: created_at,
+        sig: signedEvt.sig
+      }));
+    } catch (err) {
+      showToast('Auth error: ' + (err.message || 'Signature failed'));
+    }
+  }
+
+  function startRemotePingLoop() {
+    if (remotePingTimer) clearInterval(remotePingTimer);
+    remotePingTimer = setInterval(() => {
+      if (remoteControlDC && remoteControlDC.readyState === 'open') {
+        remoteControlDC.send(JSON.stringify({ type: 'ping' }));
+      }
+    }, 3000);
+  }
+
+  async function handleIncomingRemoteSignal(signal) {
+    if (!remoteRTC || !isRemoteDesktopActive || !signal) return;
+    try {
+      if (signal.type === 'answer' && signal.sdp) {
+        if (remoteRTC.signalingState === 'have-local-offer') {
+          await remoteRTC.setRemoteDescription(new RTCSessionDescription({
+            type: 'answer',
+            sdp: signal.sdp
+          }));
+        }
+      } else if (signal.type === 'candidate' && signal.candidate) {
+        await remoteRTC.addIceCandidate(new RTCIceCandidate({
+          candidate: signal.candidate,
+          sdpMid: signal.sdpMid,
+          sdpMLineIndex: signal.sdpMLineIndex
+        }));
+      } else if (signal.type === 'close') {
+        showToast('Remote desktop ended by host');
+        stopRemoteDesktopSession();
+      }
+    } catch (err) {}
+  }
+
+  async function sendRemoteSignal(sig) {
+    const res = await sendRequest('remote_signal', { signal: sig });
+    if (res && res.signal) {
+      await handleIncomingRemoteSignal(res.signal);
+    }
+    return res;
+  }
+
+  async function startRemoteDesktopSession() {
+    if (!isPcOnline) {
+      showToast('PC is offline');
+      return;
+    }
+    if (!config.phonePrivkey) {
+      showToast('Device not unlocked');
+      return;
+    }
+
+    try {
+      isRemoteDesktopActive = true;
+      mainDashboard.style.display = 'none';
+      if (remoteConsentModal) remoteConsentModal.style.display = 'none';
+      remoteDesktopView.style.display = 'flex';
+      remoteConnectingOverlay.style.display = 'flex';
+      remoteConnectingText.textContent = 'Requesting desktop session...';
+      remoteTransportBadge.className = 'network-badge-dot';
+      remoteTransportLabel.textContent = 'CONNECTING';
+
+      // Keep battery gauge synced
+      if (remoteBatteryText && batteryPercentText) {
+        remoteBatteryText.textContent = batteryPercentText.textContent;
+      }
+
+      // Step 1: Request session from service
+      const res = await sendRequest('remote_request');
+      if (!res || res.error || res.status !== 'ready') {
+        const errMsg = (res && (res.error || res.message)) ? (res.error || res.message) : 'Session rejected by host';
+        throw new Error(errMsg);
+      }
+
+      remoteSessionId = res.session_id;
+      remoteAuthChallenge = res.auth_challenge;
+      remoteConnectingText.textContent = 'Establishing secure WebRTC connection...';
+
+      // Step 2: Configure WebRTC PeerConnection
+      remoteRTC = new RTCPeerConnection({
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' }
+        ]
+      });
+
+      remoteRTC.addTransceiver('video', { direction: 'recvonly' });
+
+      // Create DataChannels
+      remoteControlDC = remoteRTC.createDataChannel('control', { ordered: true });
+      remoteInputDC = remoteRTC.createDataChannel('input', { ordered: false, maxRetransmits: 0 });
+
+      remoteControlDC.onopen = () => {
+        if (remoteAuthChallenge) {
+          sendInBandAuth();
+        }
+      };
+
+      remoteControlDC.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'auth_success') {
+            remoteConnectingOverlay.style.display = 'none';
+            remoteTransportBadge.className = 'network-badge-dot pulse';
+            remoteTransportLabel.textContent = activeTransport || 'CONNECTED';
+            startRemotePingLoop();
+          } else if (msg.type === 'auth_failed') {
+            showToast('Remote desktop authentication failed');
+            stopRemoteDesktopSession();
+          } else if (msg.type === 'auth_challenge') {
+            remoteAuthChallenge = msg.token;
+            sendInBandAuth();
+          } else if (msg.type === 'transport_state') {
+            if (msg.transport) {
+              remoteTransportLabel.textContent = msg.transport;
+            }
+          }
+        } catch (err) {}
+      };
+
+      remoteRTC.ontrack = (event) => {
+        if (event.streams && event.streams[0]) {
+          remoteVideo.srcObject = event.streams[0];
+        } else {
+          remoteVideo.srcObject = new MediaStream([event.track]);
+        }
+        remoteVideo.play().catch(() => {});
+      };
+
+      remoteRTC.onicecandidate = (event) => {
+        if (event.candidate && remoteSessionId) {
+          sendRemoteSignal({
+            session_id: remoteSessionId,
+            type: 'candidate',
+            candidate: event.candidate.candidate,
+            sdpMid: event.candidate.sdpMid,
+            sdpMLineIndex: event.candidate.sdpMLineIndex
+          }).catch(() => {});
+        }
+      };
+
+      remoteRTC.onconnectionstatechange = () => {
+        if (remoteRTC.connectionState === 'connected') {
+          remoteTransportBadge.className = 'network-badge-dot pulse';
+        } else if (['failed', 'disconnected', 'closed'].includes(remoteRTC.connectionState)) {
+          if (isRemoteDesktopActive) {
+            showToast('Remote desktop connection closed');
+            stopRemoteDesktopSession();
+          }
+        }
+      };
+
+      // Step 3: Create offer and send signal
+      const offer = await remoteRTC.createOffer();
+      await remoteRTC.setLocalDescription(offer);
+
+      const sigRes = await sendRemoteSignal({
+        session_id: remoteSessionId,
+        type: 'offer',
+        sdp: offer.sdp
+      });
+      if (sigRes && sigRes.signal) {
+        await handleIncomingRemoteSignal(sigRes.signal);
+      }
+    } catch (err) {
+      showToast('Failed to start remote desktop: ' + (err.message || 'Error'));
+      stopRemoteDesktopSession();
+    }
+  }
+
+  function stopRemoteDesktopSession() {
+    if (!isRemoteDesktopActive) return;
+    isRemoteDesktopActive = false;
+
+    if (remotePingTimer) {
+      clearInterval(remotePingTimer);
+      remotePingTimer = null;
+    }
+
+    if (remoteSessionId) {
+      sendRemoteSignal({
+        session_id: remoteSessionId,
+        type: 'close'
+      }).catch(() => {});
+    }
+
+    if (remoteControlDC) {
+      try { remoteControlDC.close(); } catch (e) {}
+      remoteControlDC = null;
+    }
+    if (remoteInputDC) {
+      try { remoteInputDC.close(); } catch (e) {}
+      remoteInputDC = null;
+    }
+    if (remoteRTC) {
+      try { remoteRTC.close(); } catch (e) {}
+      remoteRTC = null;
+    }
+    if (remoteVideo && remoteVideo.srcObject) {
+      try {
+        const stream = remoteVideo.srcObject;
+        if (stream.getTracks) {
+          stream.getTracks().forEach(t => t.stop());
+        }
+      } catch (e) {}
+      remoteVideo.srcObject = null;
+    }
+
+    remoteSessionId = null;
+    remoteAuthChallenge = null;
+
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    }
+    if (remoteDesktopView) {
+      remoteDesktopView.classList.remove('is-landscape');
+      remoteDesktopView.style.display = 'none';
+    }
+    if (quickActionsSheet) {
+      quickActionsSheet.classList.remove('active');
+    }
+    if (remoteConnectingOverlay) {
+      remoteConnectingOverlay.style.display = 'none';
+    }
+    if (mainDashboard) {
+      mainDashboard.style.display = 'flex';
+    }
+  }
+
+  // --- Coordinate Mapping for Letterboxed Video in Landscape ---
+  function getNormalizedVideoCoordinates(clientX, clientY) {
+    if (!remoteVideo) return null;
+    const rect = remoteVideo.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+
+    const videoAspect = (remoteVideo.videoWidth && remoteVideo.videoHeight)
+      ? (remoteVideo.videoWidth / remoteVideo.videoHeight)
+      : (16 / 9);
+    const elemAspect = rect.width / rect.height;
+
+    let renderW = rect.width;
+    let renderH = rect.height;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    if (elemAspect > videoAspect) {
+      // Pillarboxed (letterbox left and right)
+      renderW = rect.height * videoAspect;
+      offsetX = (rect.width - renderW) / 2;
+    } else {
+      // Letterboxed (letterbox top and bottom)
+      renderH = rect.width / videoAspect;
+      offsetY = (rect.height - renderH) / 2;
+    }
+
+    const relX = clientX - rect.left - offsetX;
+    const relY = clientY - rect.top - offsetY;
+
+    if (relX < 0 || relX > renderW || relY < 0 || relY > renderH) {
+      return null; // Touch was inside letterbox bar
+    }
+
+    const normX = Math.max(0.0, Math.min(1.0, relX / renderW));
+    const normY = Math.max(0.0, Math.min(1.0, relY / renderH));
+    return { x: normX, y: normY };
+  }
+
+  function isLandscapeMode() {
+    return window.innerWidth > window.innerHeight || (remoteDesktopView && remoteDesktopView.classList.contains('is-landscape'));
+  }
+
+  // --- Portrait Gesture Recognizer on #remoteTouchpadArea ---
+  if (remoteTouchpadArea) {
+    let tStartTime = 0;
+    let tStartX = 0;
+    let tStartY = 0;
+    let tLastX = 0;
+    let tLastY = 0;
+    let tIsDragging = false;
+    let tLongPressTimer = null;
+    let tLongPressTriggered = false;
+
+    let twoFingerStart = 0;
+    let twoFingerStartY = 0;
+    let twoFingerStartX = 0;
+    let twoFingerMoved = false;
+
+    remoteTouchpadArea.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      if (e.touches.length === 1) {
+        tStartTime = Date.now();
+        tStartX = e.touches[0].clientX;
+        tStartY = e.touches[0].clientY;
+        tLastX = tStartX;
+        tLastY = tStartY;
+        tIsDragging = false;
+        tLongPressTriggered = false;
+
+        if (tLongPressTimer) clearTimeout(tLongPressTimer);
+        tLongPressTimer = setTimeout(() => {
+          if (!tIsDragging) {
+            tLongPressTriggered = true;
+            sendControlMessage({ type: 'mouse_click', button: 'right' });
+            if (navigator.vibrate) navigator.vibrate(40);
+          }
+        }, GESTURE_CONFIG.LONG_PRESS_DURATION_MS);
+      } else if (e.touches.length === 2) {
+        if (tLongPressTimer) clearTimeout(tLongPressTimer);
+        twoFingerStart = Date.now();
+        twoFingerMoved = false;
+        twoFingerStartX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+        twoFingerStartY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      }
+    }, { passive: false });
+
+    remoteTouchpadArea.addEventListener('touchmove', (e) => {
+      e.preventDefault();
+      if (e.touches.length === 1) {
+        const curX = e.touches[0].clientX;
+        const curY = e.touches[0].clientY;
+        const dist = Math.hypot(curX - tStartX, curY - tStartY);
+
+        if (dist > GESTURE_CONFIG.MOVE_TOLERANCE_PX) {
+          if (tLongPressTimer) {
+            clearTimeout(tLongPressTimer);
+            tLongPressTimer = null;
+          }
+          tIsDragging = true;
+        }
+
+        if (tIsDragging) {
+          const dx = (curX - tLastX) * GESTURE_CONFIG.POINTER_SENSITIVITY;
+          const dy = (curY - tLastY) * GESTURE_CONFIG.POINTER_SENSITIVITY;
+          tLastX = curX;
+          tLastY = curY;
+          queueRelativeMove(dx, dy);
+        }
+      } else if (e.touches.length === 2) {
+        if (tLongPressTimer) clearTimeout(tLongPressTimer);
+        const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+        const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+        const deltaX = midX - twoFingerStartX;
+        const deltaY = midY - twoFingerStartY;
+
+        if (Math.hypot(deltaX, deltaY) > 4) {
+          twoFingerMoved = true;
+          // Invert deltaY for natural scroll
+          sendInputMessage({
+            type: 'scroll',
+            dy: -deltaY * GESTURE_CONFIG.SCROLL_SENSITIVITY,
+            dx: -deltaX * GESTURE_CONFIG.SCROLL_SENSITIVITY
+          });
+          twoFingerStartX = midX;
+          twoFingerStartY = midY;
+        }
+      }
+    }, { passive: false });
+
+    remoteTouchpadArea.addEventListener('touchend', (e) => {
+      e.preventDefault();
+      if (tLongPressTimer) {
+        clearTimeout(tLongPressTimer);
+        tLongPressTimer = null;
+      }
+
+      if (e.touches.length === 0) {
+        const elapsed = Date.now() - tStartTime;
+        if (!tIsDragging && !tLongPressTriggered && elapsed <= GESTURE_CONFIG.TAP_MAX_DURATION_MS) {
+          sendControlMessage({ type: 'mouse_click', button: 'left' });
+        }
+        if (twoFingerStart > 0 && !twoFingerMoved) {
+          const tfElapsed = Date.now() - twoFingerStart;
+          if (tfElapsed <= GESTURE_CONFIG.TWO_FINGER_TAP_MAX_DURATION_MS) {
+            sendControlMessage({ type: 'mouse_click', button: 'middle' });
+          }
+        }
+        twoFingerStart = 0;
+        twoFingerMoved = false;
+        tIsDragging = false;
+        tLongPressTriggered = false;
+      }
+    }, { passive: false });
+
+    remoteTouchpadArea.addEventListener('touchcancel', () => {
+      if (tLongPressTimer) {
+        clearTimeout(tLongPressTimer);
+        tLongPressTimer = null;
+      }
+      tIsDragging = false;
+      tLongPressTriggered = false;
+      twoFingerStart = 0;
+      twoFingerMoved = false;
+    });
+  }
+
+  // --- Landscape Direct-Screen Touch Recognizer on #remoteVideo ---
+  if (remoteVideo) {
+    let vStartTime = 0;
+    let vStartX = 0;
+    let vStartY = 0;
+    let vIsDragging = false;
+    let vLongPressTimer = null;
+    let vLongPressTriggered = false;
+
+    let vTwoFingerStart = 0;
+    let vTwoFingerStartY = 0;
+    let vTwoFingerStartX = 0;
+    let vTwoFingerMoved = false;
+
+    remoteVideo.addEventListener('touchstart', (e) => {
+      if (!isLandscapeMode()) return; // Screen preview is display-only in portrait
+      e.preventDefault();
+
+      if (e.touches.length === 1) {
+        const coords = getNormalizedVideoCoordinates(e.touches[0].clientX, e.touches[0].clientY);
+        if (!coords) return;
+
+        vStartTime = Date.now();
+        vStartX = e.touches[0].clientX;
+        vStartY = e.touches[0].clientY;
+        vIsDragging = false;
+        vLongPressTriggered = false;
+
+        queueAbsoluteMove(coords.x, coords.y);
+
+        if (vLongPressTimer) clearTimeout(vLongPressTimer);
+        vLongPressTimer = setTimeout(() => {
+          if (!vIsDragging) {
+            vLongPressTriggered = true;
+            sendControlMessage({ type: 'mouse_click', button: 'right' });
+            if (navigator.vibrate) navigator.vibrate(40);
+          }
+        }, GESTURE_CONFIG.LONG_PRESS_DURATION_MS);
+      } else if (e.touches.length === 2) {
+        if (vLongPressTimer) clearTimeout(vLongPressTimer);
+        vTwoFingerStart = Date.now();
+        vTwoFingerMoved = false;
+        vTwoFingerStartX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+        vTwoFingerStartY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      }
+    }, { passive: false });
+
+    remoteVideo.addEventListener('touchmove', (e) => {
+      if (!isLandscapeMode()) return;
+      e.preventDefault();
+
+      if (e.touches.length === 1) {
+        const curX = e.touches[0].clientX;
+        const curY = e.touches[0].clientY;
+        const dist = Math.hypot(curX - vStartX, curY - vStartY);
+
+        if (dist > GESTURE_CONFIG.MOVE_TOLERANCE_PX) {
+          if (vLongPressTimer) {
+            clearTimeout(vLongPressTimer);
+            vLongPressTimer = null;
+          }
+          vIsDragging = true;
+        }
+
+        if (vIsDragging) {
+          const coords = getNormalizedVideoCoordinates(curX, curY);
+          if (coords) {
+            queueAbsoluteMove(coords.x, coords.y);
+          }
+        }
+      } else if (e.touches.length === 2) {
+        if (vLongPressTimer) clearTimeout(vLongPressTimer);
+        const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+        const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+        const deltaX = midX - vTwoFingerStartX;
+        const deltaY = midY - vTwoFingerStartY;
+
+        if (Math.hypot(deltaX, deltaY) > 4) {
+          vTwoFingerMoved = true;
+          sendInputMessage({
+            type: 'scroll',
+            dy: -deltaY * GESTURE_CONFIG.SCROLL_SENSITIVITY,
+            dx: -deltaX * GESTURE_CONFIG.SCROLL_SENSITIVITY
+          });
+          vTwoFingerStartX = midX;
+          vTwoFingerStartY = midY;
+        }
+      }
+    }, { passive: false });
+
+    remoteVideo.addEventListener('touchend', (e) => {
+      if (!isLandscapeMode()) return;
+      e.preventDefault();
+
+      if (vLongPressTimer) {
+        clearTimeout(vLongPressTimer);
+        vLongPressTimer = null;
+      }
+
+      if (e.touches.length === 0) {
+        const elapsed = Date.now() - vStartTime;
+        if (!vIsDragging && !vLongPressTriggered && elapsed <= GESTURE_CONFIG.TAP_MAX_DURATION_MS) {
+          sendControlMessage({ type: 'mouse_click', button: 'left' });
+        }
+        if (vTwoFingerStart > 0 && !vTwoFingerMoved) {
+          const tfElapsed = Date.now() - vTwoFingerStart;
+          if (tfElapsed <= GESTURE_CONFIG.TWO_FINGER_TAP_MAX_DURATION_MS) {
+            sendControlMessage({ type: 'mouse_click', button: 'middle' });
+          }
+        }
+        vTwoFingerStart = 0;
+        vTwoFingerMoved = false;
+        vIsDragging = false;
+        vLongPressTriggered = false;
+      }
+    }, { passive: false });
+
+    remoteVideo.addEventListener('touchcancel', () => {
+      if (vLongPressTimer) {
+        clearTimeout(vLongPressTimer);
+        vLongPressTimer = null;
+      }
+      vIsDragging = false;
+      vLongPressTriggered = false;
+      vTwoFingerStart = 0;
+      vTwoFingerMoved = false;
+    });
+  }
+
+  // --- Remote UI Event Listeners ---
+  if (btnOpenRemoteDesktop) {
+    btnOpenRemoteDesktop.addEventListener('click', () => {
+      if (!isPcOnline) {
+        showToast('PC is offline');
+        return;
+      }
+      if (remoteConsentModal) {
+        remoteConsentModal.style.display = 'flex';
+      } else {
+        startRemoteDesktopSession();
+      }
+    });
+  }
+
+  if (btnCancelRemoteConsent) {
+    btnCancelRemoteConsent.addEventListener('click', () => {
+      if (remoteConsentModal) {
+        remoteConsentModal.style.display = 'none';
+      }
+    });
+  }
+
+  if (btnConfirmRemoteConsent) {
+    btnConfirmRemoteConsent.addEventListener('click', () => {
+      if (remoteConsentModal) {
+        remoteConsentModal.style.display = 'none';
+      }
+      startRemoteDesktopSession();
+    });
+  }
+
+  if (btnRemoteBack) {
+    btnRemoteBack.addEventListener('click', () => {
+      stopRemoteDesktopSession();
+    });
+  }
+
+  if (btnToggleOrientation) {
+    btnToggleOrientation.addEventListener('click', async () => {
+      if (!remoteDesktopView) return;
+      const willBeLandscape = !remoteDesktopView.classList.contains('is-landscape');
+      remoteDesktopView.classList.toggle('is-landscape');
+
+      try {
+        if (willBeLandscape) {
+          if (document.documentElement.requestFullscreen) {
+            await document.documentElement.requestFullscreen().catch(() => {});
+          }
+          if (screen.orientation && screen.orientation.lock) {
+            await screen.orientation.lock('landscape').catch(() => {});
+          }
+        } else {
+          if (document.fullscreenElement) {
+            await document.exitFullscreen().catch(() => {});
+          }
+          if (screen.orientation && screen.orientation.unlock) {
+            screen.orientation.unlock();
+          }
+        }
+      } catch (err) {}
+    });
+  }
+
+  // --- Quick Actions Floating Button & Actions ---
+  if (btnFloatingQuick) {
+    btnFloatingQuick.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (quickActionsSheet) {
+        quickActionsSheet.classList.toggle('active');
+      }
+    });
+  }
+
+  if (document.addEventListener) {
+    document.addEventListener('click', (e) => {
+      if (quickActionsSheet && quickActionsSheet.classList && quickActionsSheet.classList.contains('active')) {
+        if (quickActionsSheet.contains && !quickActionsSheet.contains(e.target) && e.target !== btnFloatingQuick) {
+          quickActionsSheet.classList.remove('active');
+        }
+      }
+    });
+  }
+
+  if (btnQuickLock) {
+    btnQuickLock.addEventListener('click', () => {
+      if (quickActionsSheet) quickActionsSheet.classList.remove('active');
+      btnLock.click();
+    });
+  }
+
+  if (btnQuickSleep) {
+    btnQuickSleep.addEventListener('click', () => {
+      if (quickActionsSheet) quickActionsSheet.classList.remove('active');
+      btnSleep.click();
+    });
+  }
+
+  if (btnQuickRestart) {
+    btnQuickRestart.addEventListener('click', () => {
+      if (quickActionsSheet) quickActionsSheet.classList.remove('active');
+      btnRestart.click();
+    });
+  }
+
+  if (btnQuickShutdown) {
+    btnQuickShutdown.addEventListener('click', () => {
+      if (quickActionsSheet) quickActionsSheet.classList.remove('active');
+      btnShutdown.click();
+    });
+  }
+
+  window.__remoteDesktop = {
+    start: startRemoteDesktopSession,
+    stop: stopRemoteDesktopSession,
+    getNormalizedVideoCoordinates: getNormalizedVideoCoordinates,
+    GESTURE_CONFIG: GESTURE_CONFIG,
+    sendControlMessage: sendControlMessage,
+    sendInputMessage: sendInputMessage,
+  };
 
   // Evaluate deterministic initial state on application launch
   window.__initPromise = evaluateInitialState();

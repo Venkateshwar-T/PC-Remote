@@ -12,6 +12,7 @@ import (
 	"github.com/nbd-wtf/go-nostr/nip44"
 	"laptopcontrol/internal/config"
 	"laptopcontrol/internal/pairing"
+	"laptopcontrol/internal/remote/session"
 	"laptopcontrol/internal/win32"
 )
 
@@ -26,32 +27,44 @@ var (
 	reqIDRegex = regexp.MustCompile(`^[a-zA-Z0-9_\-]{6,64}$`)
 
 	allowedActions = map[string]bool{
-		"pair":       true,
-		"telemetry":  true,
-		"lock":       true,
-		"sleep":      true,
-		"restart":    true,
-		"shutdown":   true,
-		"change_pin": true, // handled explicitly to reject remote attempts
+		"pair":           true,
+		"telemetry":      true,
+		"lock":           true,
+		"sleep":          true,
+		"restart":        true,
+		"shutdown":       true,
+		"change_pin":     true, // handled explicitly to reject remote attempts
+		"remote_request": true,
+		"remote_signal":  true,
 	}
 )
 
 type CommandPacket struct {
-	ID         string `json:"id"`
-	Action     string `json:"action"`
-	Pin        string `json:"pin,omitempty"`
-	Token      string `json:"token,omitempty"`
-	DeviceName string `json:"deviceName,omitempty"`
-	Timestamp  int64  `json:"timestamp"`
+	ID         string                   `json:"id"`
+	Action     string                   `json:"action"`
+	Pin        string                   `json:"pin,omitempty"`
+	Token      string                   `json:"token,omitempty"`
+	DeviceName string                   `json:"deviceName,omitempty"`
+	Signal     *session.SignalingPacket `json:"signal,omitempty"`
+	Timestamp  int64                    `json:"timestamp"`
 }
 
 type ResponsePacket struct {
-	ID        string      `json:"id"`
-	Status    string      `json:"status"` // "ok", "error", "unauthorized"
-	Message   string      `json:"message,omitempty"`
-	Error     string      `json:"error,omitempty"`
-	Telemetry interface{} `json:"telemetry,omitempty"`
-	Timestamp int64       `json:"timestamp"`
+	ID            string                   `json:"id"`
+	Status        string                   `json:"status"` // "ok", "error", "unauthorized", "busy", "accepted"
+	Message       string                   `json:"message,omitempty"`
+	Error         string                   `json:"error,omitempty"`
+	Telemetry     interface{}              `json:"telemetry,omitempty"`
+	SessionID     string                   `json:"sessionId,omitempty"`
+	AuthChallenge string                   `json:"authChallenge,omitempty"`
+	Signal        *session.SignalingPacket `json:"signal,omitempty"`
+	Timestamp     int64                    `json:"timestamp"`
+}
+
+// RemoteManagerInterface defines the interaction contract for Remote Desktop.
+type RemoteManagerInterface interface {
+	HandleSessionRequest(phonePubKey string) (*session.SessionResponse, error)
+	HandleSignaling(phonePubKey string, packet session.SignalingPacket) (*session.SignalingPacket, error)
 }
 
 // Handler provides unified cryptographic command validation, authorization, and execution
@@ -60,6 +73,7 @@ type Handler struct {
 	cfg              *config.Config
 	pairingMgr       *pairing.Manager
 	replayGuard      *ReplayGuard
+	remoteMgr        RemoteManagerInterface
 	onPairingSuccess func()
 	startTime        time.Time
 	mu               sync.RWMutex
@@ -82,6 +96,13 @@ func (h *Handler) SetOnPairingSuccess(fn func()) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.onPairingSuccess = fn
+}
+
+// SetRemoteManager binds the Remote Desktop session manager to the protocol handler.
+func (h *Handler) SetRemoteManager(mgr RemoteManagerInterface) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.remoteMgr = mgr
 }
 
 // ProcessCommandEvent processes an incoming signed Nostr command event through the unified security pipeline.
@@ -251,22 +272,54 @@ func (h *Handler) ProcessCommandEvent(evt *nostr.Event) (*nostr.Event, error) {
 	case "change_pin":
 		return h.BuildEncryptedResponse(evt.PubKey, cmd.ID, "error", "", "For security, Master PIN can only be changed directly on the PC desktop.", nil)
 
+	case "remote_request":
+		h.mu.RLock()
+		rm := h.remoteMgr
+		h.mu.RUnlock()
+		if rm == nil {
+			return h.BuildEncryptedResponse(evt.PubKey, cmd.ID, "error", "", "Remote Desktop capability is uninitialized on host", nil)
+		}
+		resp, err := rm.HandleSessionRequest(evt.PubKey)
+		if err != nil {
+			return h.BuildEncryptedResponse(evt.PubKey, cmd.ID, "error", "", err.Error(), nil)
+		}
+		return h.BuildEncryptedResponsePacket(evt.PubKey, ResponsePacket{
+			ID:            cmd.ID,
+			Status:        resp.Status,
+			SessionID:     resp.SessionID,
+			AuthChallenge: resp.AuthChallenge,
+			Message:       resp.Message,
+			Timestamp:     time.Now().Unix(),
+		})
+
+	case "remote_signal":
+		h.mu.RLock()
+		rm := h.remoteMgr
+		h.mu.RUnlock()
+		if rm == nil || cmd.Signal == nil {
+			return h.BuildEncryptedResponse(evt.PubKey, cmd.ID, "error", "", "Invalid or missing remote signaling packet", nil)
+		}
+		replySig, err := rm.HandleSignaling(evt.PubKey, *cmd.Signal)
+		if err != nil {
+			return h.BuildEncryptedResponse(evt.PubKey, cmd.ID, "error", "", err.Error(), nil)
+		}
+		if replySig != nil {
+			return h.BuildEncryptedResponsePacket(evt.PubKey, ResponsePacket{
+				ID:        cmd.ID,
+				Status:    "ok",
+				Signal:    replySig,
+				Timestamp: time.Now().Unix(),
+			})
+		}
+		return nil, nil // Asynchronous signaling will be emitted by worker
+
 	default:
 		return h.BuildEncryptedResponse(evt.PubKey, cmd.ID, "error", "", "Unknown action requested", nil)
 	}
 }
 
-// BuildEncryptedResponse constructs a signed, NIP-44 encrypted Nostr event reply.
-func (h *Handler) BuildEncryptedResponse(recipientPubKey, reqID, status, msg, errMsg string, telemetry interface{}) (*nostr.Event, error) {
-	resp := ResponsePacket{
-		ID:        reqID,
-		Status:    status,
-		Message:   msg,
-		Error:     errMsg,
-		Telemetry: telemetry,
-		Timestamp: time.Now().Unix(),
-	}
-
+// BuildEncryptedResponsePacket constructs a signed, NIP-44 encrypted Nostr event from a ResponsePacket.
+func (h *Handler) BuildEncryptedResponsePacket(recipientPubKey string, resp ResponsePacket) (*nostr.Event, error) {
 	data, err := json.Marshal(resp)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal response packet: %w", err)
@@ -297,3 +350,16 @@ func (h *Handler) BuildEncryptedResponse(recipientPubKey, reqID, status, msg, er
 
 	return respEvt, nil
 }
+
+// BuildEncryptedResponse constructs a signed, NIP-44 encrypted Nostr event reply.
+func (h *Handler) BuildEncryptedResponse(recipientPubKey, reqID, status, msg, errMsg string, telemetry interface{}) (*nostr.Event, error) {
+	return h.BuildEncryptedResponsePacket(recipientPubKey, ResponsePacket{
+		ID:        reqID,
+		Status:    status,
+		Message:   msg,
+		Error:     errMsg,
+		Telemetry: telemetry,
+		Timestamp: time.Now().Unix(),
+	})
+}
+

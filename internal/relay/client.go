@@ -137,11 +137,19 @@ func (c *Client) HandleEvent(evt *nostr.Event) {
 		return
 	}
 
-	// Publish response across all active relays concurrently with a 4-second timeout
+	c.PublishEvent(respEvt)
+}
+
+// PublishEvent publishes a prepared Nostr event across all configured relays concurrently.
+func (c *Client) PublishEvent(evt *nostr.Event) {
+	if evt == nil || c.pool == nil {
+		return
+	}
 	pubCtx, pubCancel := context.WithTimeout(c.ctx, 4*time.Second)
 	defer pubCancel()
 
-	results := c.pool.PublishMany(pubCtx, c.relays, *respEvt)
+	results := c.pool.PublishMany(pubCtx, c.relays, *evt)
 	for range results {
 	}
 }
+

@@ -50,6 +50,9 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "install"; StatusMsg: "Registerin
 ; 2. Add narrow scoped Windows Firewall rule for LAN server on port 8765
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""PC Remote LAN Server"" dir=in action=allow program=""{app}\{#MyAppExeName}"" protocol=TCP localport=8765 profile=private"; StatusMsg: "Configuring local network firewall rule..."; Flags: runhidden waituntilterminated
 
+; 2b. Add narrow scoped Windows Firewall rule for WebRTC UDP on port 8765
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""PC Remote WebRTC"" dir=in action=allow program=""{app}\{#MyAppExeName}"" protocol=UDP localport=8765 profile=private"; StatusMsg: "Configuring WebRTC firewall rule..."; Flags: runhidden waituntilterminated
+
 ; 3. Start background service immediately
 Filename: "{app}\{#MyAppExeName}"; Parameters: "start"; StatusMsg: "Starting background service..."; Flags: runhidden waituntilterminated
 
@@ -65,6 +68,9 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "uninstall"; Flags: runhidden wai
 
 ; 3. Remove Windows Firewall rule
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""PC Remote LAN Server"""; Flags: runhidden waituntilterminated; RunOnceId: "DeletePCRemoteFirewallRule"
+
+; 3b. Remove WebRTC Windows Firewall rule
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""PC Remote WebRTC"""; Flags: runhidden waituntilterminated; RunOnceId: "DeletePCRemoteWebRTCFirewallRule"
 
 [UninstallDelete]
 Type: files; Name: "{app}\{#MyAppExeName}"
