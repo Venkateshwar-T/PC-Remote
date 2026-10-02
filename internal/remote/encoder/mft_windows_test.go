@@ -22,7 +22,7 @@ func TestMFT_GUIDsAgainstWindowsSDK(t *testing.T) {
 		{
 			name:     "IID_IMFTransform",
 			actual:   iidIMFTransform,
-			expected: "{bf803747-0e08-4639-a819-399120e6c436}",
+			expected: "{bf94c121-5b05-4e6f-8000-ba598961414d}",
 		},
 		{
 			name:     "MFMediaType_Video",
