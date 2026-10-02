@@ -3,6 +3,7 @@ package protocol
 import (
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -355,3 +356,123 @@ func TestProtocol_RemoteRequestTiming(t *testing.T) {
 		t.Fatalf("expected SessionID sess-123, got %s", resp.SessionID)
 	}
 }
+
+func TestProtocol_NormalCommandSmallLimits(t *testing.T) {
+	cfg, _, _, handler := setupTestEnvironment(t)
+
+	clientPrivKey := nostr.GeneratePrivateKey()
+	clientPubKey, _ := nostr.GetPublicKey(clientPrivKey)
+	_ = cfg.AuthorizeDevice(clientPubKey, "Authorized Phone")
+
+	// 1. Normal command exceeding 4 KB plaintext must be rejected
+	oversizedPin := strings.Repeat("A", 4500)
+	cmdOversized := CommandPacket{
+		ID:        "req-limit-001",
+		Action:    "telemetry",
+		Pin:       oversizedPin,
+		Timestamp: time.Now().Unix(),
+	}
+	evtOversized := createClientEvent(t, clientPrivKey, cfg.LaptopPubKey, cmdOversized)
+	_, err := handler.ProcessCommandEvent(evtOversized)
+	if err == nil {
+		t.Fatal("Expected oversized normal command to be rejected, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds limit") {
+		t.Fatalf("Expected limit error message, got: %v", err)
+	}
+
+	// 2. Normal command within 4 KB plaintext must be accepted
+	cmdValid := CommandPacket{
+		ID:        "req-limit-002",
+		Action:    "telemetry",
+		Timestamp: time.Now().Unix(),
+	}
+	evtValid := createClientEvent(t, clientPrivKey, cfg.LaptopPubKey, cmdValid)
+	respEvt, err := handler.ProcessCommandEvent(evtValid)
+	if err != nil {
+		t.Fatalf("Valid normal command should succeed: %v", err)
+	}
+	resp := decryptResponse(t, respEvt, clientPrivKey, cfg.LaptopPubKey)
+	if resp.Status != "ok" {
+		t.Fatalf("Expected status ok, got %s", resp.Status)
+	}
+}
+
+func TestProtocol_RemoteSignalLargeAccepted(t *testing.T) {
+	cfg, _, _, handler := setupTestEnvironment(t)
+
+	clientPrivKey := nostr.GeneratePrivateKey()
+	clientPubKey, _ := nostr.GetPublicKey(clientPrivKey)
+	_ = cfg.AuthorizeDevice(clientPubKey, "Authorized Phone")
+
+	mockRM := &mockRemoteManager{}
+	handler.SetRemoteManager(mockRM)
+
+	// Construct realistic large SDP offer (~6 KB plaintext), which encrypts to > 8 KB ciphertext
+	largeSDP := "v=0\r\no=- 123456789 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n" + strings.Repeat("a=candidate:1 1 UDP 2130706431 192.168.1.100 50000 typ host\r\n", 100)
+	if len(largeSDP) < 5000 {
+		t.Fatalf("Test setup error: largeSDP too small: %d", len(largeSDP))
+	}
+
+	cmd := CommandPacket{
+		ID:        "req-sig-large",
+		Action:    "remote_signal",
+		Signal: &session.SignalingPacket{
+			Type:      session.SignalOffer,
+			SessionID: "sess-123",
+			SDP:       largeSDP,
+		},
+		Timestamp: time.Now().Unix(),
+	}
+	evt := createClientEvent(t, clientPrivKey, cfg.LaptopPubKey, cmd)
+
+	// Verify that ciphertext exceeds 8 KB (reproducing the observed 9648-byte issue)
+	if len(evt.Content) <= 8192 {
+		t.Fatalf("Expected ciphertext > 8192 bytes, got %d", len(evt.Content))
+	}
+
+	respEvt, err := handler.ProcessCommandEvent(evt)
+	if err != nil {
+		t.Fatalf("Large remote_signal (>4KB plaintext / >8KB ciphertext) must be accepted, got: %v", err)
+	}
+	if respEvt == nil {
+		t.Fatal("Expected response event, got nil")
+	}
+
+	resp := decryptResponse(t, respEvt, clientPrivKey, cfg.LaptopPubKey)
+	if resp.Status != "ok" {
+		t.Fatalf("Expected status ok, got %s", resp.Status)
+	}
+}
+
+func TestProtocol_RemoteSignalOversizedSDPRejected(t *testing.T) {
+	cfg, _, _, handler := setupTestEnvironment(t)
+
+	clientPrivKey := nostr.GeneratePrivateKey()
+	clientPubKey, _ := nostr.GetPublicKey(clientPrivKey)
+	_ = cfg.AuthorizeDevice(clientPubKey, "Authorized Phone")
+
+	mockRM := &mockRemoteManager{}
+	handler.SetRemoteManager(mockRM)
+
+	// SDP exceeding 64 KB
+	hugeSDP := strings.Repeat("a=candidate:1 1 UDP 2130706431 192.168.1.100 50000 typ host\r\n", 1000)
+
+	cmd := CommandPacket{
+		ID:        "req-sig-huge",
+		Action:    "remote_signal",
+		Signal: &session.SignalingPacket{
+			Type:      session.SignalOffer,
+			SessionID: "sess-123",
+			SDP:       hugeSDP,
+		},
+		Timestamp: time.Now().Unix(),
+	}
+	evt := createClientEvent(t, clientPrivKey, cfg.LaptopPubKey, cmd)
+
+	_, err := handler.ProcessCommandEvent(evt)
+	if err == nil {
+		t.Fatal("Expected huge SDP to be rejected, got nil")
+	}
+}
+

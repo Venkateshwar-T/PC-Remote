@@ -20,6 +20,7 @@ const (
 	MsgHeartbeat          AgentMessageType = "heartbeat"
 	MsgTerminate          AgentMessageType = "terminate"
 	MsgStatusUpdate       AgentMessageType = "status_update"
+	MsgWorkerError        AgentMessageType = "worker_error"
 )
 
 const (
@@ -60,6 +61,25 @@ type StatusUpdatePayload struct {
 	TransportType string               `json:"transportType,omitempty"`
 	SelectedPair  string               `json:"selectedPair,omitempty"`
 	Message       string               `json:"message,omitempty"`
+}
+
+// WorkerErrorPayload carries diagnostic information when session worker initialization fails.
+type WorkerErrorPayload struct {
+	Stage     string `json:"stage"`
+	Error     string `json:"error"`
+	Win32Code uint32 `json:"win32Code,omitempty"`
+	HResult   int32  `json:"hresult,omitempty"`
+}
+
+// Validate checks that required error fields are present.
+func (p *WorkerErrorPayload) Validate() error {
+	if p.Stage == "" {
+		return errors.New("worker error stage must not be empty")
+	}
+	if p.Error == "" {
+		return errors.New("worker error message must not be empty")
+	}
+	return nil
 }
 
 // EncodeEnvelope serializes an envelope with trailing newline for line-delimited JSON streaming.

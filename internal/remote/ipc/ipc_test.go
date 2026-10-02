@@ -441,3 +441,51 @@ func TestSessionPipe_InitSessionDeliveryWithDeferredReadLoop(t *testing.T) {
 		t.Fatalf("timeout: MsgInitSession was lost before or during StartReadLoop")
 	}
 }
+
+func TestWorkerErrorPayload_Validation(t *testing.T) {
+	// 1. Valid payload with Win32 and HResult
+	valid := WorkerErrorPayload{
+		Stage:     "capture_init",
+		Error:     "IDXGIOutput1::DuplicateOutput failed: 0x887A0004",
+		Win32Code: 0x887A0004,
+		HResult:   -2005270524,
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("expected valid payload to pass validation, got: %v", err)
+	}
+
+	// Encode and decode envelope
+	data, err := EncodeEnvelope(MsgWorkerError, "sess_err_1", valid)
+	if err != nil {
+		t.Fatalf("failed to encode envelope: %v", err)
+	}
+
+	var env AgentEnvelope
+	if err := json.Unmarshal(data[:len(data)-1], &env); err != nil {
+		t.Fatalf("failed to unmarshal envelope: %v", err)
+	}
+	if env.Type != MsgWorkerError {
+		t.Fatalf("expected type %s, got %s", MsgWorkerError, env.Type)
+	}
+
+	var decoded WorkerErrorPayload
+	if err := json.Unmarshal(env.Payload, &decoded); err != nil {
+		t.Fatalf("failed to unmarshal payload: %v", err)
+	}
+	if decoded.Stage != "capture_init" || decoded.Error != valid.Error || decoded.Win32Code != valid.Win32Code || decoded.HResult != valid.HResult {
+		t.Fatalf("decoded payload mismatch: %+v vs %+v", decoded, valid)
+	}
+
+	// 2. Missing Stage
+	missingStage := WorkerErrorPayload{Error: "some error"}
+	if err := missingStage.Validate(); err == nil {
+		t.Fatalf("expected error for empty stage, got nil")
+	}
+
+	// 3. Missing Error
+	missingErr := WorkerErrorPayload{Stage: "encoder_init"}
+	if err := missingErr.Validate(); err == nil {
+		t.Fatalf("expected error for empty error message, got nil")
+	}
+}
+

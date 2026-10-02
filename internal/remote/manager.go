@@ -22,9 +22,10 @@ type SessionManager struct {
 	spawner        *spawner.Spawner
 	mu             sync.Mutex
 	activeProcess  *spawner.ProcessHandle
-	activePipe     *remoteipc.SessionPipeServer
-	outboundSignal func(phonePubKey string, packet session.SignalingPacket)
-	closed         bool
+	activePipe      *remoteipc.SessionPipeServer
+	outboundSignal  func(phonePubKey string, packet session.SignalingPacket)
+	lastWorkerError string
+	closed          bool
 }
 
 // NewSessionManager creates a new Remote Desktop manager bound to the service daemon.
@@ -84,6 +85,10 @@ func (m *SessionManager) HandleSessionRequest(reqID, phonePubKey string) (*sessi
 	sessionID := info.SessionID
 	authChallenge := info.AuthChallenge
 	pipeName := fmt.Sprintf(`\\.\pipe\PCRemote_Session_%s`, sessionID)
+
+	m.mu.Lock()
+	m.lastWorkerError = ""
+	m.mu.Unlock()
 
 	// 3. Start dedicated session named pipe server
 	userSID := m.cfg.AuthorizedUserSID
@@ -362,6 +367,31 @@ func (m *SessionManager) handleAgentMessage(env *remoteipc.AgentEnvelope) {
 			}
 		}
 
+	case remoteipc.MsgWorkerError:
+		var errPayload remoteipc.WorkerErrorPayload
+		if err := json.Unmarshal(env.Payload, &errPayload); err != nil {
+			log.Printf("[RemoteMgr] [Session: %s] Malformed worker error payload: %v", env.SessionID, err)
+			_ = m.sm.Transition(env.SessionID, session.StateFailed)
+			return
+		}
+
+		var codeInfo string
+		if errPayload.Win32Code != 0 {
+			codeInfo += fmt.Sprintf(" (Win32: %d / 0x%08X)", errPayload.Win32Code, errPayload.Win32Code)
+		}
+		if errPayload.HResult != 0 {
+			codeInfo += fmt.Sprintf(" (HRESULT: 0x%08X)", uint32(errPayload.HResult))
+		}
+
+		errDesc := fmt.Sprintf("worker error at stage %q: %s%s", errPayload.Stage, errPayload.Error, codeInfo)
+		log.Printf("[RemoteMgr] [Session: %s] Worker error received: %s", env.SessionID, errDesc)
+
+		m.mu.Lock()
+		m.lastWorkerError = errDesc
+		m.mu.Unlock()
+
+		_ = m.sm.Transition(env.SessionID, session.StateFailed)
+
 	case remoteipc.MsgTerminate:
 		log.Printf("[RemoteMgr] Agent requested termination for session %s", env.SessionID)
 		_ = m.sm.Terminate(env.SessionID, "agent terminated")
@@ -385,7 +415,11 @@ func (m *SessionManager) cleanupActiveSession(sessionID string) {
 			log.Printf("[RemoteMgr] Terminating session worker process (PID %d) for session %s", m.activeProcess.PID(), sessionID)
 			m.activeProcess.Terminate()
 		} else {
-			log.Printf("[RemoteMgr] [Session: %s] worker exited, exit reason: session worker process (PID %d) exited with code %d (0x%X)", sessionID, m.activeProcess.PID(), code, code)
+			exitDetail := fmt.Sprintf("session worker process (PID %d) exited with code %d (0x%X)", m.activeProcess.PID(), code, code)
+			if m.lastWorkerError != "" {
+				exitDetail = fmt.Sprintf("%s; underlying failure: %s", exitDetail, m.lastWorkerError)
+			}
+			log.Printf("[RemoteMgr] [Session: %s] worker exited, exit reason: %s", sessionID, exitDetail)
 		}
 		m.activeProcess = nil
 	}

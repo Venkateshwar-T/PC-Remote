@@ -7,6 +7,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"regexp"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -18,6 +20,8 @@ import (
 	"laptopcontrol/internal/remote/session"
 	"laptopcontrol/internal/remote/webrtc"
 )
+
+var hexCodeRegex = regexp.MustCompile(`(?i)\b0x([0-9a-fA-F]{8})\b`)
 
 // AgentConfig holds the parameters passed to the session-agent worker process.
 type AgentConfig struct {
@@ -86,27 +90,30 @@ func (a *SessionAgent) Run() (err error) {
 	case initPayload = <-initReceived:
 		log.Printf("[Agent] [Session: %s] worker received InitSession (STUN count: %d, UDPPort: %d)", a.cfg.SessionID, len(initPayload.STUNServers), initPayload.UDPPort)
 	case <-time.After(10 * time.Second):
-		return errors.New("timeout waiting for InitSession configuration from daemon")
+		return a.reportStartupError("init_session_timeout", errors.New("timeout waiting for InitSession configuration from daemon"))
 	case <-a.stopChan:
 		log.Printf("[Agent] [Session: %s] worker exited, exit reason: stop requested before InitSession", a.cfg.SessionID)
 		return nil
 	}
 
-	// 4. Initialize Desktop Duplication capture and encoder
+	// 5. Initialize Desktop Duplication capture and encoder
 	if err := a.capture.Init(); err != nil {
-		log.Printf("[Agent] Warning: initial capture init error: %v", err)
+		return a.reportStartupError("capture_init", fmt.Errorf("failed to initialize desktop capture: %w", err))
 	}
 	width, height := a.capture.Dimensions()
+	if width <= 0 || height <= 0 {
+		return a.reportStartupError("capture_init", fmt.Errorf("invalid screen dimensions from capture: %dx%d", width, height))
+	}
 
 	fps := 30
 	bitrate := 2500000 // 2.5 Mbps default
 	if err := a.encoder.Init(width, height, fps, bitrate); err != nil {
-		return fmt.Errorf("failed to initialize video encoder: %w", err)
+		return a.reportStartupError("encoder_init", fmt.Errorf("failed to initialize video encoder: %w", err))
 	}
 	defer a.encoder.Close()
 	defer a.capture.Close()
 
-	// 5. Initialize WebRTC PeerConnection
+	// 6. Initialize WebRTC PeerConnection
 	peer, err := webrtc.NewSessionPeer(
 		a.cfg.SessionID,
 		a.cfg.AuthChallenge,
@@ -116,7 +123,7 @@ func (a *SessionAgent) Run() (err error) {
 		a.injector,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to initialize WebRTC peer: %w", err)
+		return a.reportStartupError("webrtc_init", fmt.Errorf("failed to initialize WebRTC peer: %w", err))
 	}
 	a.peer = peer
 	defer peer.Close()
@@ -175,6 +182,36 @@ func (a *SessionAgent) Run() (err error) {
 
 	log.Printf("[Agent] [Session: %s] worker exited, exit reason: %s", a.cfg.SessionID, exitReason)
 	return nil
+}
+
+func (a *SessionAgent) reportStartupError(stage string, err error) error {
+	log.Printf("[Agent] [Session: %s] startup failed at stage %q: %v", a.cfg.SessionID, stage, err)
+	payload := remoteipc.WorkerErrorPayload{
+		Stage: stage,
+		Error: err.Error(),
+	}
+
+	var sysErr syscall.Errno
+	if errors.As(err, &sysErr) {
+		payload.Win32Code = uint32(sysErr)
+	}
+
+	if matches := hexCodeRegex.FindStringSubmatch(err.Error()); len(matches) > 1 {
+		if val, parseErr := strconv.ParseUint(matches[1], 16, 32); parseErr == nil {
+			payload.HResult = int32(val)
+			if payload.Win32Code == 0 {
+				payload.Win32Code = uint32(val)
+			}
+		}
+	}
+
+	if a.pipeClient != nil {
+		if sendErr := a.pipeClient.Send(remoteipc.MsgWorkerError, a.cfg.SessionID, payload); sendErr != nil {
+			log.Printf("[Agent] [Session: %s] failed to send worker error over pipe: %v", a.cfg.SessionID, sendErr)
+		}
+	}
+
+	return fmt.Errorf("%s failed: %w", stage, err)
 }
 
 // Stop cleanly terminates the worker.

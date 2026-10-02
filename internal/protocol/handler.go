@@ -18,10 +18,16 @@ import (
 )
 
 const (
-	MaxEventSize      = 16 * 1024 // 16 KB max serialized event size
-	MaxCiphertextSize = 8 * 1024  // 8 KB max ciphertext length
-	MaxPlaintextSize  = 4 * 1024  // 4 KB max decrypted plaintext size
-	MaxDeviceNameLen  = 64
+	MaxEventSize               = 64 * 1024 // 64 KB max serialized event size
+	MaxNormalCiphertextSize     = 8 * 1024  // 8 KB max ciphertext length for normal commands
+	MaxSignalingCiphertextSize  = 32 * 1024 // 32 KB max ciphertext length for remote WebRTC signaling
+	MaxCiphertextSize          = MaxSignalingCiphertextSize // Global envelope upper bound (32 KB)
+
+	MaxNormalPlaintextSize      = 4 * 1024  // 4 KB max decrypted plaintext size for normal commands
+	MaxSignalingPlaintextSize   = 32 * 1024 // 32 KB max decrypted plaintext size for remote WebRTC signaling
+	MaxPlaintextSize           = MaxNormalPlaintextSize // Maintained for backwards-compatibility (4 KB)
+
+	MaxDeviceNameLen           = 64
 )
 
 var (
@@ -113,9 +119,9 @@ func (h *Handler) ProcessCommandEvent(evt *nostr.Event) (*nostr.Event, error) {
 		return nil, errors.New("nil event provided")
 	}
 
-	// 1. Strict event size validation
-	if len(evt.Content) > MaxCiphertextSize {
-		return nil, fmt.Errorf("ciphertext size (%d bytes) exceeds limit of %d bytes", len(evt.Content), MaxCiphertextSize)
+	// 1. Strict envelope ciphertext size validation (bounded to MaxSignalingCiphertextSize)
+	if len(evt.Content) > MaxSignalingCiphertextSize {
+		return nil, fmt.Errorf("ciphertext size (%d bytes) exceeds maximum limit of %d bytes", len(evt.Content), MaxSignalingCiphertextSize)
 	}
 
 	// 2. Validate event Kind and destination 'p' tag
@@ -151,8 +157,8 @@ func (h *Handler) ProcessCommandEvent(evt *nostr.Event) (*nostr.Event, error) {
 		return nil, fmt.Errorf("NIP-44 decryption failed: %w", err)
 	}
 
-	if len(plaintext) > MaxPlaintextSize {
-		return nil, fmt.Errorf("plaintext size (%d bytes) exceeds limit of %d bytes", len(plaintext), MaxPlaintextSize)
+	if len(plaintext) > MaxSignalingPlaintextSize {
+		return nil, fmt.Errorf("plaintext size (%d bytes) exceeds maximum limit of %d bytes", len(plaintext), MaxSignalingPlaintextSize)
 	}
 
 	// 5. Parse and validate Command Packet schema
@@ -167,6 +173,23 @@ func (h *Handler) ProcessCommandEvent(evt *nostr.Event) (*nostr.Event, error) {
 
 	if !allowedActions[cmd.Action] {
 		return nil, fmt.Errorf("action '%s' is not permitted", cmd.Action)
+	}
+
+	// 5b. Action-specific size & schema validation
+	if cmd.Action != "remote_signal" {
+		if len(evt.Content) > MaxNormalCiphertextSize {
+			return nil, fmt.Errorf("ciphertext size (%d bytes) exceeds limit of %d bytes for non-signaling action '%s'", len(evt.Content), MaxNormalCiphertextSize, cmd.Action)
+		}
+		if len(plaintext) > MaxNormalPlaintextSize {
+			return nil, fmt.Errorf("plaintext size (%d bytes) exceeds limit of %d bytes for non-signaling action '%s'", len(plaintext), MaxNormalPlaintextSize, cmd.Action)
+		}
+	} else {
+		if cmd.Signal == nil {
+			return nil, errors.New("remote_signal action requires non-nil signal payload")
+		}
+		if err := cmd.Signal.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid signaling payload: %w", err)
+		}
 	}
 
 	// 6. Sender-scoped Replay Guard & Freshness Verification
