@@ -55,8 +55,8 @@ func NewSessionAgent(cfg AgentConfig) *SessionAgent {
 func (a *SessionAgent) Run() error {
 	log.Printf("[Agent] Starting session-agent worker for session %s", a.cfg.SessionID)
 
-	// 1. Connect to service daemon session named pipe
-	client, err := remoteipc.ConnectSessionPipe(a.cfg.PipeName, 10*time.Second)
+	// 1. Connect to service daemon session named pipe and transmit handshake hello
+	client, err := remoteipc.ConnectSessionPipe(a.cfg.PipeName, a.cfg.SessionID, 10*time.Second)
 	if err != nil {
 		return fmt.Errorf("failed to connect to daemon session pipe: %w", err)
 	}

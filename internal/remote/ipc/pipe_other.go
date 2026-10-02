@@ -9,7 +9,7 @@ import (
 
 type SessionPipeServer struct{}
 
-func NewSessionPipeServer(pipeName, userSID string) (*SessionPipeServer, error) {
+func NewSessionPipeServer(pipeName, sessionID, userSID string) (*SessionPipeServer, error) {
 	return nil, errors.New("named pipes only supported on Windows")
 }
 func (s *SessionPipeServer) SetOnMessage(fn func(env *AgentEnvelope)) {}
@@ -22,7 +22,7 @@ func (s *SessionPipeServer) Close() error { return nil }
 
 type SessionPipeClient struct{}
 
-func ConnectSessionPipe(pipeName string, timeout time.Duration) (*SessionPipeClient, error) {
+func ConnectSessionPipe(pipeName, sessionID string, timeout time.Duration) (*SessionPipeClient, error) {
 	return nil, errors.New("named pipes only supported on Windows")
 }
 func (c *SessionPipeClient) SetOnMessage(fn func(env *AgentEnvelope)) {}

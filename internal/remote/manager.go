@@ -85,7 +85,7 @@ func (m *SessionManager) HandleSessionRequest(phonePubKey string) (*session.Sess
 
 	// 3. Start dedicated session named pipe server
 	userSID := m.cfg.AuthorizedUserSID
-	pipeServer, err := remoteipc.NewSessionPipeServer(pipeName, userSID)
+	pipeServer, err := remoteipc.NewSessionPipeServer(pipeName, sessionID, userSID)
 	if err != nil {
 		_ = m.sm.Transition(sessionID, session.StateFailed)
 		return nil, fmt.Errorf("failed to initialize session named pipe: %w", err)

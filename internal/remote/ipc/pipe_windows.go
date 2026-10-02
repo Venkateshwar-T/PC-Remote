@@ -19,6 +19,7 @@ import (
 // SessionPipeServer manages the daemon side of the session named pipe.
 type SessionPipeServer struct {
 	pipeName       string
+	sessionID      string
 	userSID        string
 	listener       *rootipc.PipeListener
 	conn           *rootipc.PipeConn
@@ -30,16 +31,17 @@ type SessionPipeServer struct {
 }
 
 // NewSessionPipeServer creates and listens on a dedicated named pipe for this session.
-func NewSessionPipeServer(pipeName, userSID string) (*SessionPipeServer, error) {
+func NewSessionPipeServer(pipeName, sessionID, userSID string) (*SessionPipeServer, error) {
 	listener, err := rootipc.ListenPipe(pipeName, userSID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen on session pipe %s: %w", pipeName, err)
 	}
 
 	return &SessionPipeServer{
-		pipeName: pipeName,
-		userSID:  userSID,
-		listener: listener,
+		pipeName:  pipeName,
+		sessionID: sessionID,
+		userSID:   userSID,
+		listener:  listener,
 	}, nil
 }
 
@@ -57,14 +59,59 @@ func (s *SessionPipeServer) SetOnClientClosed(fn func()) {
 	s.onClientClosed = fn
 }
 
-// Accept blocks until the session-agent connects and passes identity verification.
+// Accept blocks until the session-agent connects, reads the handshake hello, and passes identity verification.
 func (s *SessionPipeServer) Accept() error {
 	conn, err := s.listener.Accept()
 	if err != nil {
 		return err
 	}
 
-	// Verify client identity via impersonation
+	reader := bufio.NewReader(conn)
+
+	// Read hello line bounded by MaxHelloMessageSize and HelloTimeout
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	ch := make(chan readResult, 1)
+	go func() {
+		buf := make([]byte, 0, 512)
+		for len(buf) < MaxHelloMessageSize {
+			b, err := reader.ReadByte()
+			if err != nil {
+				ch <- readResult{nil, err}
+				return
+			}
+			if b == '\n' {
+				ch <- readResult{buf, nil}
+				return
+			}
+			buf = append(buf, b)
+		}
+		ch <- readResult{nil, errors.New("oversized agent hello handshake")}
+	}()
+
+	var line []byte
+	select {
+	case res := <-ch:
+		if res.err != nil {
+			_ = conn.Close()
+			return fmt.Errorf("failed to read agent hello handshake: %w", res.err)
+		}
+		line = res.data
+	case <-time.After(HelloTimeout):
+		_ = conn.Close() // unblocks the goroutine and terminates immediately
+		return errors.New("timeout waiting for agent hello handshake")
+	}
+
+	// Parse and validate the hello handshake envelope
+	_, err = ParseAndValidateHello(line, s.sessionID)
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("agent hello handshake rejected: %w", err)
+	}
+
+	// ONLY AFTER DATA HAS BEEN READ: Verify client identity via Win32 impersonation
 	ident, err := rootipc.GetClientIdentity(conn.Handle())
 	if err != nil {
 		_ = conn.Close()
@@ -77,9 +124,10 @@ func (s *SessionPipeServer) Accept() error {
 		return fmt.Errorf("unauthorized process (SID %s) connected to session pipe", ident.SID)
 	}
 
+	// Store connection and EXACT SAME buffered reader, then launch background readLoop
 	s.mu.Lock()
 	s.conn = conn
-	s.reader = bufio.NewReader(conn)
+	s.reader = reader
 	s.mu.Unlock()
 
 	go s.readLoop()
@@ -180,11 +228,26 @@ type SessionPipeClient struct {
 	onMessage func(env *AgentEnvelope)
 }
 
-// ConnectSessionPipe dials the daemon's session named pipe.
-func ConnectSessionPipe(pipeName string, timeout time.Duration) (*SessionPipeClient, error) {
+// ConnectSessionPipe dials the daemon's session named pipe and immediately transmits MsgAgentHello.
+func ConnectSessionPipe(pipeName, sessionID string, timeout time.Duration) (*SessionPipeClient, error) {
 	conn, err := rootipc.Dial(pipeName, timeout)
 	if err != nil {
 		return nil, err
+	}
+
+	// Immediately transmit MsgAgentHello before waiting for daemon bootstrap
+	helloPayload := AgentHelloPayload{
+		SessionID: sessionID,
+		Timestamp: time.Now().Unix(),
+	}
+	helloData, err := EncodeEnvelope(MsgAgentHello, sessionID, helloPayload)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("failed to encode agent hello: %w", err)
+	}
+	if _, err := conn.Write(helloData); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("failed to write agent hello to pipe: %w", err)
 	}
 
 	client := &SessionPipeClient{
