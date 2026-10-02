@@ -12,6 +12,8 @@ type ProcessHandle struct{}
 func (p *ProcessHandle) Terminate()                  {}
 func (p *ProcessHandle) IsRunning() bool             { return false }
 func (p *ProcessHandle) WaitForExit(d time.Duration) bool { return true }
+func (p *ProcessHandle) GetExitCode() (uint32, bool) { return 0, false }
+func (p *ProcessHandle) PID() uint32                 { return 0 }
 
 type Spawner struct{}
 

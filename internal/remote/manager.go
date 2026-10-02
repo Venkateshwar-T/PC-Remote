@@ -115,7 +115,7 @@ func (m *SessionManager) HandleSessionRequest(reqID, phonePubKey string) (*sessi
 			Timestamp: time.Now().Unix(),
 		}, nil
 	}
-	log.Printf("[RemoteReq Timing] [Req: %s] [Session: %s] session-agent process spawned (took %v, elapsed: %v)", reqID, sessionID, time.Since(spawnStart), time.Since(reqStart))
+	log.Printf("[RemoteMgr] [Req: %s] [Session: %s] agent process spawned (PID: %d, took %v, elapsed: %v)", reqID, sessionID, procHandle.PID(), time.Since(spawnStart), time.Since(reqStart))
 
 	m.mu.Lock()
 	m.activeProcess = procHandle
@@ -126,13 +126,25 @@ func (m *SessionManager) HandleSessionRequest(reqID, phonePubKey string) (*sessi
 		m.handleAgentMessage(env)
 	})
 	pipeServer.SetOnClientClosed(func() {
-		log.Printf("[RemoteMgr] Session pipe closed by agent for session %s", sessionID)
+		m.mu.Lock()
+		activeProc := m.activeProcess
+		m.mu.Unlock()
+
+		exitReason := "session pipe closed by agent"
+		if activeProc != nil {
+			if code, running := activeProc.GetExitCode(); !running {
+				exitReason = fmt.Sprintf("session worker process exited with code %d (0x%X)", code, code)
+			} else {
+				exitReason = fmt.Sprintf("session worker process (PID %d) still active but closed pipe", activeProc.PID())
+			}
+		}
+		log.Printf("[RemoteMgr] [Session: %s] worker exited, exit reason: %s", sessionID, exitReason)
 		_ = m.sm.Transition(sessionID, session.StateStopped)
 	})
 
 	connectedChan := make(chan error, 1)
 	acceptStart := time.Now()
-	log.Printf("[RemoteReq Timing] [Req: %s] [Session: %s] pipe Accept started (pipe: %s, elapsed: %v)", reqID, sessionID, pipeName, time.Since(reqStart))
+	log.Printf("[RemoteMgr] [Req: %s] [Session: %s] pipe Accept started (pipe: %s, elapsed: %v)", reqID, sessionID, pipeName, time.Since(reqStart))
 
 	go func() {
 		connectedChan <- pipeServer.Accept()
@@ -142,32 +154,48 @@ func (m *SessionManager) HandleSessionRequest(reqID, phonePubKey string) (*sessi
 	case err := <-connectedChan:
 		if err != nil {
 			m.mu.Lock()
+			activeProc := m.activeProcess
 			if m.activePipe == pipeServer {
 				_ = pipeServer.Close()
 				m.activePipe = nil
 			}
 			m.mu.Unlock()
 			_ = m.sm.Transition(sessionID, session.StateFailed)
-			log.Printf("[RemoteReq Timing] [Req: %s] [Session: %s] Session pipe accept failed after %v: %v", reqID, sessionID, time.Since(acceptStart), err)
+
+			exitReason := err.Error()
+			if activeProc != nil {
+				if code, running := activeProc.GetExitCode(); !running {
+					exitReason = fmt.Sprintf("worker process (PID %d) exited with code %d (0x%X), accept error: %v", activeProc.PID(), code, code, err)
+				}
+			}
+			log.Printf("[RemoteMgr] [Req: %s] [Session: %s] worker exited, exit reason: %s (took %v)", reqID, sessionID, exitReason, time.Since(acceptStart))
 			return &session.SessionResponse{
 				Status:    "error",
-				Message:   fmt.Sprintf("Failed to establish pipe with session worker: %v", err),
+				Message:   fmt.Sprintf("Failed to establish pipe with session worker: %s", exitReason),
 				Timestamp: time.Now().Unix(),
 			}, nil
 		}
-		log.Printf("[RemoteReq Timing] [Req: %s] [Session: %s] pipe connected (wait took %v, elapsed: %v)", reqID, sessionID, time.Since(acceptStart), time.Since(reqStart))
+		log.Printf("[RemoteMgr] [Req: %s] [Session: %s] agent pipe connected (wait took %v, elapsed: %v)", reqID, sessionID, time.Since(acceptStart), time.Since(reqStart))
 	case <-time.After(5 * time.Second):
 		m.mu.Lock()
+		activeProc := m.activeProcess
 		if m.activePipe == pipeServer {
 			_ = pipeServer.Close()
 			m.activePipe = nil
 		}
 		m.mu.Unlock()
 		_ = m.sm.Transition(sessionID, session.StateFailed)
-		log.Printf("[RemoteReq Timing] [Req: %s] [Session: %s] Session agent launch timed out after 5s (elapsed: %v)", reqID, sessionID, time.Since(reqStart))
+
+		exitReason := "worker did not connect within 5s"
+		if activeProc != nil {
+			if code, running := activeProc.GetExitCode(); !running {
+				exitReason = fmt.Sprintf("worker process (PID %d) exited prematurely with code %d (0x%X)", activeProc.PID(), code, code)
+			}
+		}
+		log.Printf("[RemoteMgr] [Req: %s] [Session: %s] worker exited, exit reason: %s (elapsed: %v)", reqID, sessionID, exitReason, time.Since(reqStart))
 		return &session.SessionResponse{
 			Status:    "error",
-			Message:   "Session worker took too long to connect",
+			Message:   fmt.Sprintf("Session worker failed to connect: %s", exitReason),
 			Timestamp: time.Now().Unix(),
 		}, nil
 	}
@@ -183,26 +211,37 @@ func (m *SessionManager) HandleSessionRequest(reqID, phonePubKey string) (*sessi
 		},
 		UDPPort: 8765,
 	}
+
+	log.Printf("[RemoteMgr] [Req: %s] [Session: %s] InitSession send attempted", reqID, sessionID)
 	if err := pipeServer.Send(remoteipc.MsgInitSession, sessionID, initPayload); err != nil {
-		log.Printf("[RemoteReq Timing] [Req: %s] [Session: %s] Failed to send InitSession to agent after %v: %v", reqID, sessionID, time.Since(initStart), err)
 		m.mu.Lock()
+		activeProc := m.activeProcess
 		if m.activePipe == pipeServer {
 			_ = pipeServer.Close()
 			m.activePipe = nil
 		}
 		m.mu.Unlock()
 		_ = m.sm.Transition(sessionID, session.StateFailed)
+
+		exitReason := err.Error()
+		if activeProc != nil {
+			if code, running := activeProc.GetExitCode(); !running {
+				exitReason = fmt.Sprintf("worker process (PID %d) exited with code %d (0x%X), write error: %v", activeProc.PID(), code, code, err)
+			}
+		}
+		log.Printf("[RemoteMgr] [Req: %s] [Session: %s] InitSession send failed after %v: %v", reqID, sessionID, time.Since(initStart), err)
+		log.Printf("[RemoteMgr] [Req: %s] [Session: %s] worker exited, exit reason: %s", reqID, sessionID, exitReason)
 		return &session.SessionResponse{
 			Status:    "error",
-			Message:   "Failed to initialize session worker",
+			Message:   fmt.Sprintf("Failed to initialize session worker: %v", err),
 			Timestamp: time.Now().Unix(),
 		}, nil
 	}
-	log.Printf("[RemoteReq Timing] [Req: %s] [Session: %s] InitSession sent (took %v, elapsed: %v)", reqID, sessionID, time.Since(initStart), time.Since(reqStart))
+	log.Printf("[RemoteMgr] [Req: %s] [Session: %s] InitSession send succeeded (took %v, elapsed: %v)", reqID, sessionID, time.Since(initStart), time.Since(reqStart))
 
 	_ = m.sm.Transition(sessionID, session.StateSignaling)
 
-	log.Printf("[RemoteReq Timing] [Req: %s] [Session: %s] HandleSessionRequest completed (status: ready, total elapsed: %v)", reqID, sessionID, time.Since(reqStart))
+	log.Printf("[RemoteMgr] [Req: %s] [Session: %s] HandleSessionRequest completed (status: ready, total elapsed: %v)", reqID, sessionID, time.Since(reqStart))
 
 	return &session.SessionResponse{
 		Status:        "ready",
@@ -328,7 +367,13 @@ func (m *SessionManager) cleanupActiveSession(sessionID string) {
 	}
 
 	if m.activeProcess != nil {
-		m.activeProcess.Terminate()
+		code, running := m.activeProcess.GetExitCode()
+		if running {
+			log.Printf("[RemoteMgr] Terminating session worker process (PID %d) for session %s", m.activeProcess.PID(), sessionID)
+			m.activeProcess.Terminate()
+		} else {
+			log.Printf("[RemoteMgr] [Session: %s] worker exited, exit reason: session worker process (PID %d) exited with code %d (0x%X)", sessionID, m.activeProcess.PID(), code, code)
+		}
 		m.activeProcess = nil
 	}
 }

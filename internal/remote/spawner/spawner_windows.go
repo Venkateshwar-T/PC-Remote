@@ -206,3 +206,28 @@ func (p *ProcessHandle) WaitForExit(timeout time.Duration) bool {
 	res, _ := windows.WaitForSingleObject(h, millis)
 	return res == windows.WAIT_OBJECT_0
 }
+
+// GetExitCode returns the process exit code and whether it is still running.
+func (p *ProcessHandle) GetExitCode() (uint32, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.ProcessHandle == 0 {
+		return 0, false
+	}
+	var exitCode uint32
+	err := windows.GetExitCodeProcess(p.ProcessHandle, &exitCode)
+	if err != nil {
+		return 0, false
+	}
+	const STILL_ACTIVE = 259
+	return exitCode, exitCode == STILL_ACTIVE
+}
+
+// PID returns the OS process ID of the spawned worker.
+func (p *ProcessHandle) PID() uint32 {
+	if p == nil {
+		return 0
+	}
+	return p.ProcessID
+}

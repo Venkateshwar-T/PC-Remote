@@ -52,31 +52,43 @@ func NewSessionAgent(cfg AgentConfig) *SessionAgent {
 }
 
 // Run connects to the daemon session pipe and executes the worker lifecycle.
-func (a *SessionAgent) Run() error {
+func (a *SessionAgent) Run() (err error) {
 	log.Printf("[Agent] Starting session-agent worker for session %s", a.cfg.SessionID)
+	defer func() {
+		if err != nil {
+			log.Printf("[Agent] [Session: %s] worker exited, exit reason: %v", a.cfg.SessionID, err)
+		}
+	}()
 
 	// 1. Connect to service daemon session named pipe and transmit handshake hello
 	client, err := remoteipc.ConnectSessionPipe(a.cfg.PipeName, a.cfg.SessionID, 10*time.Second)
 	if err != nil {
 		return fmt.Errorf("failed to connect to daemon session pipe: %w", err)
 	}
+	log.Printf("[Agent] [Session: %s] agent pipe connected", a.cfg.SessionID)
 	a.pipeClient = client
 	defer client.Close()
 
-	// 2. Wire daemon incoming message handler
+	// 2. Wire daemon incoming message handler BEFORE starting reader
 	initReceived := make(chan remoteipc.InitSessionPayload, 1)
 	client.SetOnMessage(func(env *remoteipc.AgentEnvelope) {
 		a.handleDaemonMessage(env, initReceived)
 	})
 
-	// 3. Wait for bootstrap configuration from daemon
+	// 3. Start reader loop NOW that callback is registered
+	if err := client.StartReadLoop(); err != nil {
+		return fmt.Errorf("failed to start session pipe read loop: %w", err)
+	}
+
+	// 4. Wait for bootstrap configuration from daemon
 	var initPayload remoteipc.InitSessionPayload
 	select {
 	case initPayload = <-initReceived:
-		log.Printf("[Agent] Received session bootstrap configuration from daemon")
+		log.Printf("[Agent] [Session: %s] worker received InitSession (STUN count: %d, UDPPort: %d)", a.cfg.SessionID, len(initPayload.STUNServers), initPayload.UDPPort)
 	case <-time.After(10 * time.Second):
 		return errors.New("timeout waiting for InitSession configuration from daemon")
 	case <-a.stopChan:
+		log.Printf("[Agent] [Session: %s] worker exited, exit reason: stop requested before InitSession", a.cfg.SessionID)
 		return nil
 	}
 
@@ -148,16 +160,20 @@ func (a *SessionAgent) Run() error {
 	go a.heartbeatLoop()
 
 	// 8. Wait for termination or interrupt
+	var exitReason string
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	select {
-	case <-sigChan:
-		log.Println("[Agent] Received OS signal, stopping...")
+	case sig := <-sigChan:
+		exitReason = fmt.Sprintf("OS signal (%v)", sig)
+		log.Printf("[Agent] [Session: %s] Received OS signal (%v), stopping...", a.cfg.SessionID, sig)
 	case <-a.stopChan:
-		log.Println("[Agent] Stop requested, exiting...")
+		exitReason = "stop requested"
+		log.Printf("[Agent] [Session: %s] Stop requested, exiting...", a.cfg.SessionID)
 	}
 
+	log.Printf("[Agent] [Session: %s] worker exited, exit reason: %s", a.cfg.SessionID, exitReason)
 	return nil
 }
 

@@ -111,12 +111,16 @@ func (s *SessionPipeServer) Accept() error {
 		return fmt.Errorf("agent hello handshake rejected: %w", err)
 	}
 
+	log.Printf("[SessionPipeServer] [Session: %s] hello received (%d bytes)", s.sessionID, len(line))
+
 	// ONLY AFTER DATA HAS BEEN READ: Verify client identity via Win32 impersonation
 	ident, err := rootipc.GetClientIdentity(conn.Handle())
 	if err != nil {
 		_ = conn.Close()
 		return fmt.Errorf("failed to verify session-agent identity: %w", err)
 	}
+
+	log.Printf("[SessionPipeServer] [Session: %s] identity verified for agent (SID: %s, IsSystem: %t, IsAdmin: %t)", s.sessionID, ident.SID, ident.IsSystem, ident.IsAdmin)
 
 	// Authorized if client matches configured userSID, or is SYSTEM / Administrator
 	if s.userSID != "" && ident.SID != s.userSID && !ident.IsSystem && !ident.IsAdmin {
@@ -142,23 +146,23 @@ func (s *SessionPipeServer) Send(msgType AgentMessageType, sessionID string, pay
 	}
 
 	s.mu.Lock()
-	conn := s.conn
-	s.mu.Unlock()
+	defer s.mu.Unlock()
 
-	if conn == nil {
-		return errors.New("agent not connected")
+	if s.closed || s.conn == nil {
+		return errors.New("agent not connected to session pipe")
 	}
 
-	_, err = conn.Write(data)
+	_, err = s.conn.Write(data)
 	return err
 }
 
 func (s *SessionPipeServer) readLoop() {
 	defer func() {
 		s.mu.Lock()
+		isClosed := s.closed
 		cb := s.onClientClosed
 		s.mu.Unlock()
-		if cb != nil {
+		if !isClosed && cb != nil {
 			cb()
 		}
 	}()
@@ -193,6 +197,8 @@ func (s *SessionPipeServer) readLoop() {
 
 		if cb != nil {
 			cb(&env)
+		} else {
+			log.Printf("[SessionPipeServer] [Session: %s] Warning: message type %s received before callback installed", s.sessionID, env.Type)
 		}
 	}
 }
@@ -220,15 +226,18 @@ func (s *SessionPipeServer) Close() error {
 
 // SessionPipeClient manages the session-agent worker side of the named pipe.
 type SessionPipeClient struct {
-	pipeName  string
-	conn      *rootipc.PipeConn
-	reader    *bufio.Reader
-	mu        sync.Mutex
-	closed    bool
-	onMessage func(env *AgentEnvelope)
+	pipeName    string
+	conn        *rootipc.PipeConn
+	reader      *bufio.Reader
+	mu          sync.Mutex
+	closed      bool
+	readStarted bool
+	onMessage   func(env *AgentEnvelope)
 }
 
 // ConnectSessionPipe dials the daemon's session named pipe and immediately transmits MsgAgentHello.
+// It connects the named pipe and transmits hello, but DOES NOT start the background reader.
+// To prevent dropping messages, the caller must call SetOnMessage() followed by StartReadLoop().
 func ConnectSessionPipe(pipeName, sessionID string, timeout time.Duration) (*SessionPipeClient, error) {
 	conn, err := rootipc.Dial(pipeName, timeout)
 	if err != nil {
@@ -255,8 +264,25 @@ func ConnectSessionPipe(pipeName, sessionID string, timeout time.Duration) (*Ses
 		conn:     conn,
 		reader:   bufio.NewReader(conn),
 	}
-	go client.readLoop()
 	return client, nil
+}
+
+// StartReadLoop initiates the background reader goroutine.
+// It must be called ONLY AFTER SetOnMessage() has been installed to prevent dropped messages.
+func (c *SessionPipeClient) StartReadLoop() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed || c.conn == nil {
+		return errors.New("not connected to session pipe")
+	}
+	if c.readStarted {
+		return errors.New("read loop already started")
+	}
+	c.readStarted = true
+
+	go c.readLoop()
+	return nil
 }
 
 // SetOnMessage registers a callback for incoming messages from daemon.
@@ -274,14 +300,13 @@ func (c *SessionPipeClient) Send(msgType AgentMessageType, sessionID string, pay
 	}
 
 	c.mu.Lock()
-	conn := c.conn
-	c.mu.Unlock()
+	defer c.mu.Unlock()
 
-	if conn == nil {
+	if c.closed || c.conn == nil {
 		return errors.New("not connected to session pipe")
 	}
 
-	_, err = conn.Write(data)
+	_, err = c.conn.Write(data)
 	return err
 }
 
@@ -312,6 +337,8 @@ func (c *SessionPipeClient) readLoop() {
 
 		if cb != nil {
 			cb(&env)
+		} else {
+			log.Printf("[SessionPipeClient] Warning: message type %s discarded (callback not installed)", env.Type)
 		}
 	}
 }

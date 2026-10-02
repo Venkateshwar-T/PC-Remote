@@ -338,7 +338,9 @@ func runSessionAgentCommand(args []string) {
 
 	agent := worker.NewSessionAgent(cfg)
 	if err := agent.Run(); err != nil {
+		log.Printf("[Agent] [Session: %s] worker exited, exit reason: %v", *sessionID, err)
 		log.Fatalf("Session-agent execution error: %v", err)
 	}
+	log.Printf("[Agent] [Session: %s] worker exited, exit reason: clean shutdown", *sessionID)
 }
 
