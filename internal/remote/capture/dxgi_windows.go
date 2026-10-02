@@ -47,12 +47,29 @@ const (
 
 	DXGI_FORMAT_B8G8R8A8_UNORM = 87
 
-	D3D11_USAGE_STAGING    = 3
-	D3D11_CPU_ACCESS_READ  = 0x00020000
-	D3D11_MAP_READ         = 1
+	D3D11_USAGE_STAGING   = 3
+	D3D11_CPU_ACCESS_READ = 0x00020000
+	D3D11_MAP_READ        = 1
 
 	DXGI_ERROR_WAIT_TIMEOUT = 0x887A0027
 	DXGI_ERROR_ACCESS_LOST  = 0x887A0026
+	DXGI_ERROR_INVALID_CALL = 0x887A0001
+
+	// DXGI_ERROR_NOT_CURRENTLY_AVAILABLE is returned when another process already
+	// holds the duplication (e.g. a previous session-agent that has not exited yet).
+	DXGI_ERROR_NOT_CURRENTLY_AVAILABLE = 0x887A0022
+
+	// IDXGIOutput1::DuplicateOutput vtable index.
+	//
+	// Vtable indices are absolute from IUnknown, so a derived interface continues
+	// its parent's numbering instead of restarting:
+	//   IUnknown        0-2   (QueryInterface/AddRef/Release)
+	//   IDXGIObject     3-6
+	//   IDXGIOutput     7-18  (GetFrameStatistics = 18)
+	//   IDXGIOutput1    19-22 (DuplicateOutput = 22)
+	// Using 18 here calls GetFrameStatistics, which takes a DXGI_FRAME_STATISTICS*
+	// out-parameter and returns DXGI_ERROR_INVALID_CALL (0x887A0001).
+	vtIDXGIOutput1DuplicateOutput = 22
 )
 
 type dxgiOutduplPointerPosition struct {
@@ -93,15 +110,15 @@ type d3d11MappedSubresource struct {
 
 // DXGICapture implements Desktop Duplication on Windows.
 type DXGICapture struct {
-	mu           sync.Mutex
-	d3d11Device  uintptr
-	d3d11Context uintptr
-	duplication  uintptr
-	stagingTex   uintptr
-	width        int
-	height       int
+	mu            sync.Mutex
+	d3d11Device   uintptr
+	d3d11Context  uintptr
+	duplication   uintptr
+	stagingTex    uintptr
+	width         int
+	height        int
 	frameAcquired bool
-	cachedBuffer []byte
+	cachedBuffer  []byte
 }
 
 // NewDXGICapture creates a new Desktop Duplication capture instance.
@@ -126,9 +143,9 @@ func (c *DXGICapture) initLocked() error {
 	featureLevels := []uint32{0xb000, 0xa100, 0xa000, 0x9300} // 11.0, 10.1, 10.0, 9.3
 
 	ret, _, _ := procD3D11CreateDevice.Call(
-		0,                         // pAdapter: default
+		0,                        // pAdapter: default
 		D3D_DRIVER_TYPE_HARDWARE, // DriverType
-		0,                         // Software module
+		0,                        // Software module
 		D3D11_CREATE_DEVICE_BGRA_SUPPORT,
 		uintptr(unsafe.Pointer(&featureLevels[0])),
 		uintptr(len(featureLevels)),
@@ -191,11 +208,25 @@ func (c *DXGICapture) initLocked() error {
 	}
 	defer comRelease(pDXGIOutput1)
 
-	// 6. Duplicate Output: IDXGIOutput1::DuplicateOutput (vtable index 18)
+	// 6. Duplicate Output: IDXGIOutput1::DuplicateOutput (vtable index 22)
+	// Retry briefly on DXGI_ERROR_NOT_CURRENTLY_AVAILABLE: a previous session-agent
+	// may still be tearing down its own duplication of this output.
 	var pDuplication uintptr
-	ret = comCall(pDXGIOutput1, 18, pDevice, uintptr(unsafe.Pointer(&pDuplication)))
-	if int32(ret) < 0 {
-		return fmt.Errorf("IDXGIOutput1::DuplicateOutput failed: 0x%08X", ret)
+	var dupRet uintptr
+	for attempt := 0; attempt < 10; attempt++ {
+		var out uintptr
+		dupRet = comCall(pDXGIOutput1, vtIDXGIOutput1DuplicateOutput, pDevice, uintptr(unsafe.Pointer(&out)))
+		if int32(dupRet) >= 0 {
+			pDuplication = out
+			break
+		}
+		if uint32(dupRet) != DXGI_ERROR_NOT_CURRENTLY_AVAILABLE {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if pDuplication == 0 {
+		return fmt.Errorf("IDXGIOutput1::DuplicateOutput failed: 0x%08X", dupRet)
 	}
 	c.duplication = pDuplication
 

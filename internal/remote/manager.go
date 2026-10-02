@@ -20,11 +20,11 @@ type outboundSignalFn func(phonePubKey string, packet session.SignalingPacket)
 
 // SessionManager coordinates Remote Desktop session orchestration, worker lifecycle, and signaling.
 type SessionManager struct {
-	cfg            *config.Config
-	sm             *session.StateMachine
-	spawner        *spawner.Spawner
-	mu             sync.Mutex
-	activeProcess  *spawner.ProcessHandle
+	cfg             *config.Config
+	sm              *session.StateMachine
+	spawner         *spawner.Spawner
+	mu              sync.Mutex
+	activeProcess   *spawner.ProcessHandle
 	activePipe      *remoteipc.SessionPipeServer
 	outboundSignal  outboundSignalFn
 	lastWorkerError string
