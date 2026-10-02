@@ -189,6 +189,15 @@ async function runTests() {
   assert(config.SCROLL_SENSITIVITY > 0, 'Scroll sensitivity must be positive');
   console.log('  -> PASS: Gesture thresholds and parameters within specified tolerances.\n');
 
+  console.log('Testing Canonical Signaling Types Handling...');
+  const handleSig = mockWindow.__remoteDesktop.handleIncomingRemoteSignal;
+  assert.strictEqual(typeof handleSig, 'function', 'handleIncomingRemoteSignal must be exported');
+  await handleSig({ type: 'ice-candidate', candidate: 'dummy' });
+  await handleSig({ type: 'candidate', candidate: 'dummy' });
+  await handleSig({ type: 'session-close' });
+  await handleSig({ type: 'close' });
+  console.log('  -> PASS: Signaling handles both canonical and alias names gracefully.\n');
+
   console.log('========================================================');
   console.log('  ALL REMOTE DESKTOP TESTS PASSED SUCCESSFULLY');
   console.log('========================================================\n');

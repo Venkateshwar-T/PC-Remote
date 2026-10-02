@@ -1,371 +1,608 @@
-FIX THE REMOTE DESKTOP SESSION-PIPE STARTUP BUG.
+FIX THE CURRENT REMOTE DESKTOP "REQUEST TIMED OUT" BUG AND THE SIGNALING PROTOCOL MISMATCH.
 
-I tested the current implementation and Remote Desktop currently fails immediately with:
+I tested the latest main branch after the MsgAgentHello named-pipe fix.
 
-"Failed to establish pipe with session worker:
-failed to verify session-agent identity:
-ImpersonateNamedPipeClient failed:
-Unable to impersonate using a named pipe until data has been read from that pipe."
+Current behavior:
 
-I inspected the current implementation.
+1. Click Remote Desktop.
+2. Click Allow Access.
+3. Remote Desktop view appears.
+4. PC briefly shows a busy/spinning cursor.
+5. The remote view remains black / does not become usable.
+6. After waiting, browser returns to Dashboard with:
+   "Failed to start remote desktop: Request timed out"
 
-ROOT CAUSE:
+I inspected the current codebase.
 
-internal/remote/ipc/pipe_windows.go -> SessionPipeServer.Accept()
+The named-pipe handshake issue has already been fixed.
+Do NOT undo that fix.
 
-currently does:
+ROOT CAUSE #1:
+The Remote Desktop signaling request is asynchronous on the host, but the browser treats it as a normal request/response RPC.
 
-1. listener.Accept()
-2. rootipc.GetClientIdentity(conn.Handle())
-3. GetClientIdentity() immediately calls ImpersonateNamedPipeClient()
-4. Windows rejects it because the server has not read any message from the pipe yet.
+Current browser flow:
 
-At the same time:
+sendRemoteSignal()
+    -> sendRequest('remote_signal', ...)
+    -> waits for matching request ID
+    -> timeout after 6500 ms
 
-internal/remote/worker/agent.go
+Current protocol handler:
 
-ConnectSessionPipe() connects to the pipe and then waits for MsgInitSession from the daemon.
+case "remote_signal":
+    ...
+    replySig, err := rm.HandleSignaling(...)
+    ...
+    if replySig != nil {
+        return encrypted response...
+    }
+    return nil, nil // Asynchronous signaling will be emitted by worker
 
-Therefore there is a startup deadlock/order bug:
+Therefore the original request never receives a correlated response.
 
-SERVER:
-connect -> impersonate -> fail
+The worker's answer is emitted asynchronously through the remote manager's outbound signaling callback, but that does NOT resolve the original pending request.
 
-WORKER:
-connect -> wait for InitSession
-
-The server must read a client message before calling ImpersonateNamedPipeClient().
-
-DO NOT FIX THIS BY REMOVING IMPERSONATION OR DISABLING THE IDENTITY CHECK.
-
-DO NOT weaken the named-pipe ACL.
-
-DO NOT replace this with unauthenticated localhost TCP/WebSocket.
-
-DO NOT trust the handshake message itself as proof of identity.
-
-Implement a proper pipe handshake.
+This MUST be fixed.
 
 ==================================================
-REQUIRED FIX
+REQUIRED ARCHITECTURE
 ==================================================
 
-Add a dedicated first message from the worker:
+Keep asynchronous WebRTC signaling.
 
-MsgAgentHello
+Do NOT force all signaling through a synchronous request/response model.
 
-The worker MUST send this immediately after connecting to the session pipe, before waiting for InitSession.
+The correct distinction is:
 
-The hello should contain at minimum:
+REQUEST/RESPONSE:
+- remote_request
+- normal PC commands
+
+ASYNC SIGNALING:
+- offer
+- answer
+- ICE candidates
+- session close
+- signaling state
+
+The browser must NOT wait 6.5 seconds for an async signaling request to complete merely because the signaling message itself was accepted.
+
+==================================================
+PREFERRED FIX
+==================================================
+
+When the host successfully accepts/forwards a remote_signal message:
+
+return an IMMEDIATE correlated acknowledgment using the SAME request ID.
+
+For example:
 
 {
-    type: "agent_hello",
-    sessionId: <worker session ID>,
-    timestamp: ...
+    id: <original request ID>,
+    status: "ok",
+    message: "signaling forwarded"
 }
 
-Prefer a small typed payload if the existing protocol structure benefits from it.
+The actual WebRTC answer/candidates remain asynchronous signaling messages.
+
+Therefore:
+
+remote_signal request
+    ->
+host validates
+    ->
+host forwards to session-agent
+    ->
+host immediately returns ACK
+    ->
+browser resolves sendRemoteSignal()
+    ->
+actual answer arrives separately through the existing async signaling path
+
+Do NOT block the HTTP/Nostr command request waiting for the WebRTC worker.
+
+Do NOT invent arbitrary fake timing.
+
+Do NOT increase the 6500 ms timeout as a workaround.
 
 ==================================================
-SERVER ACCEPT ORDER
+PROTOCOL HANDLER CHANGE
 ==================================================
 
-Change SessionPipeServer.Accept() to:
+Inspect:
 
-1. Accept the named-pipe connection.
-2. Create a single bufio.Reader for the connection.
-3. Read exactly one newline-delimited handshake envelope from that reader.
-4. Bound the handshake size. Do not allow an unbounded read.
-5. Parse the envelope.
-6. Verify:
-   - message type == MsgAgentHello
-   - SessionID == expected session's SessionID
-   - timestamp/freshness is reasonable
-   - malformed/oversized handshake is rejected
-7. ONLY AFTER DATA HAS BEEN READ:
-   call rootipc.GetClientIdentity(conn.Handle())
-8. Verify the actual Windows client identity.
-9. Require the worker identity to match the expected AuthorizedUserSID according to the existing security policy.
-10. Reject the connection on any failure.
-11. Only after identity verification succeeds:
-    store the connection and reader in SessionPipeServer.
-12. Start readLoop() using THE SAME bufio.Reader instance.
+internal/protocol/handler.go
 
-IMPORTANT:
-Do not create a second bufio.Reader after the handshake.
+Current remote_signal branch:
 
-The initial handshake bytes may already have been buffered by the first reader. Reusing that reader is required so subsequent messages are not lost.
+    replySig, err := rm.HandleSignaling(evt.PubKey, *cmd.Signal)
 
-==================================================
-WORKER CONNECT ORDER
-==================================================
+If forwarding succeeds and replySig == nil, return a normal encrypted response packet:
 
-Change ConnectSessionPipe()/SessionAgent startup so that:
+ResponsePacket{
+    ID:        cmd.ID,
+    Status:    "ok",
+    Message:   "signaling forwarded",
+    Timestamp: time.Now().Unix(),
+}
 
-1. Connect to pipe.
-2. Immediately send MsgAgentHello.
-3. Only then start waiting for MsgInitSession.
-4. Start the normal read loop without racing the hello message.
+This MUST be returned for successfully forwarded asynchronous signaling.
 
-The hello MUST be sent before the worker waits for daemon bootstrap.
+If HandleSignaling returns an actual immediate reply signal:
+preserve that behavior and include Signal as before.
 
-Avoid starting the read loop in a way that can accidentally consume its own/other startup state incorrectly.
+If HandleSignaling fails:
+return the existing error response.
 
-Preserve existing asynchronous behavior where possible.
+Do not return nil,nil for a successfully forwarded command.
+
+This ensures the browser's pendingRequests entry resolves correctly.
 
 ==================================================
-HANDSHAKE IMPLEMENTATION
+VERY IMPORTANT: FIX SIGNAL TYPE MISMATCH
 ==================================================
 
-Prefer reusing the existing:
+The Go canonical values in:
 
-EncodeEnvelope()
+internal/remote/session/types.go
+
+are:
+
+offer
+answer
+ice-candidate
+session-auth
+session-challenge
+session-accepted
+session-rejected
+session-close
+heartbeat
+error
+
+The browser currently sends/handles:
+
+candidate
+close
+
+This is inconsistent and must be corrected.
+
+Update the web client to use the exact canonical names.
+
+Browser -> host:
+- offer
+- ice-candidate
+- session-close
+- heartbeat
+
+Host -> browser:
+- answer
+- ice-candidate
+- session-close
+- error
+etc.
+
+Do NOT modify the Go protocol merely to accommodate the incorrect browser strings.
+
+Use the existing Go protocol as the canonical protocol definition.
+
+==================================================
+WEB CLIENT CHANGES
+==================================================
+
+Inspect:
+
+web/app.js
+
+Current code sends:
+
+type: 'candidate'
+
+Change this to:
+
+type: 'ice-candidate'
+
+Current code sends:
+
+type: 'close'
+
+Change this to:
+
+type: 'session-close'
+
+Current incoming handler currently checks:
+
+signal.type === 'candidate'
+
+Change to:
+
+signal.type === 'ice-candidate'
+
+Current incoming handler currently checks:
+
+signal.type === 'close'
+
+Change to:
+
+signal.type === 'session-close'
+
+Do not add duplicate aliases unless necessary for backwards compatibility with an already deployed version.
+
+The current protocol is still under active development, so use one canonical naming scheme.
+
+==================================================
+sendRemoteSignal() BEHAVIOR
+==================================================
+
+After the host starts returning the immediate ACK, update the browser code so that:
+
+async function sendRemoteSignal(sig)
+
+1. Sends remote_signal.
+2. Waits only for the immediate ACK.
+3. If ACK contains an actual response signal, process it.
+4. Otherwise simply return the ACK.
+
+Do NOT treat "no signal in ACK" as an error.
+
+The actual answer/ICE packets will arrive through the existing asynchronous remote signaling path.
+
+Example conceptual behavior:
+
+const res = await sendRequest('remote_signal', { signal: sig });
+
+if (res && res.signal) {
+    await handleIncomingRemoteSignal(res.signal);
+}
+
+return res;
+
+That part may already work once the host sends the ACK.
+
+==================================================
+ASYNC ANSWER PATH
+==================================================
+
+Preserve the current architecture where the worker sends:
+
+MsgSignalAgentToPhone
+
+and SessionManager.handleAgentMessage() calls:
+
+outboundSignal(phonePubKey, packet)
+
+and Daemon publishes the encrypted signaling response through Nostr.
+
+Do not remove this asynchronous path.
+
+Ensure that:
+
+- offer answer arrives asynchronously
+- browser processes it even though the original remote_signal ACK is separate
+- answer is matched to the active session ID
+- wrong-session packets are ignored
+- wrong-laptop packets are ignored
+- wrong-phone packets are ignored
+
+The browser's async signaling handler must continue to work without depending on the original request ID.
+
+==================================================
+LOCAL LAN PATH
+==================================================
+
+Inspect:
+
+internal/server/local_server.go
+
+and the current handling of ProcessCommandEvent() returning nil.
+
+Currently /api/control may encode a nil response.
+
+After this fix, remote_signal should return a real encrypted response event containing the ACK.
+
+Therefore direct LAN signaling must also return a valid encrypted response.
+
+Do not leave the LAN path returning JSON null for a successfully forwarded remote_signal.
+
+The same cryptographic response mechanism must be used as other commands.
+
+==================================================
+NOSTR PATH
+==================================================
+
+For remote/Nostr transport:
+
+The original remote_signal request must receive an encrypted ACK with the ORIGINAL request ID.
+
+The worker-generated async answer may remain a separate encrypted event.
+
+The browser must process both.
+
+Example:
+
+EVENT A:
+    request ID = req_123
+    action = remote_signal
+    signal = offer
+
+HOST RESPONSE A:
+    id = req_123
+    status = ok
+    message = signaling forwarded
+
+EVENT B:
+    id = sig_456
+    signal = answer
+
+Browser:
+    resolves pending req_123 from A
+    processes answer from B independently
+
+Do NOT attempt to make EVENT B have the original request ID unless you redesign the entire signaling correlation system intentionally.
+
+==================================================
+SESSION CLOSE
+==================================================
+
+The current browser sends "close", which the Go validator rejects.
+
+Correct it to "session-close".
+
+The server already understands:
+
+SignalSessionClose
 
 and:
 
-AgentEnvelope
+m.sm.Terminate(...)
 
-protocol.
+Make sure it is actually reached.
 
-Do not invent a second serialization format.
+After the browser exits Remote Desktop:
+- session-close reaches host
+- StateMachine terminates session
+- session manager cleans pipe/process
+- session-agent exits
+- WebRTC closes
+- capture closes
+- encoder closes
 
-Add a dedicated message constant:
-
-MsgAgentHello AgentMessageType = "agent_hello"
-
-Optionally add:
-
-type AgentHelloPayload struct {
-    SessionID string `json:"sessionId"`
-    Timestamp int64 `json:"timestamp"`
-}
-
-However, keep the actual envelope SessionID field authoritative if that is cleaner.
-
-Do not duplicate SessionID unnecessarily unless there is a concrete validation reason.
+No lingering worker should remain.
 
 ==================================================
-SECURITY REQUIREMENTS
+IMPORTANT CLEANUP BUG TO REVIEW
 ==================================================
 
-The first message is NOT authentication.
+Inspect:
 
-It only exists because Windows requires data to have been read before ImpersonateNamedPipeClient() can identify the client's security context.
+internal/remote/manager.go
 
-The server MUST NOT authorize the worker based solely on:
+Current HandleSessionRequest holds:
 
-- session ID
-- timestamp
-- PID supplied by client
-- arbitrary hello fields
+m.mu.Lock()
+defer m.mu.Unlock()
 
-Actual Windows identity verification must happen after the handshake read.
+for the entire function, including:
+- spawning worker
+- waiting for pipe Accept()
+- waiting up to 5 seconds
 
-The current GetClientIdentity() security behavior must remain intact.
+This is unnecessarily broad locking.
 
-If impersonation fails:
-- reject connection
-- close pipe
-- do not process further messages
-- do not send InitSession
-- do not spawn/use the worker as trusted
+Do NOT blindly rewrite it, but audit whether this lock can interact with:
+- cleanupActiveSession()
+- state machine termination callbacks
+- async signaling
+- worker disconnect callbacks
 
-If SID does not match the expected worker identity:
-- reject connection
-- close pipe
+Avoid holding SessionManager's global mutex while performing slow blocking operations.
 
-Do not execute any privileged client request before identity verification.
+Refactor only if needed to prevent deadlocks/races.
 
-==================================================
-HANDSHAKE TIMEOUT
-==================================================
+Use narrow critical sections.
 
-Do not allow Accept() to block forever waiting for a hello message.
-
-Use a short bounded handshake timeout.
-
-Possible approach:
-- connection deadline if compatible with the existing PipeConn implementation
-- or a controlled goroutine/select timeout
-
-Do not introduce a goroutine leak.
-
-A client connecting without sending a hello must be rejected after the timeout.
+Do NOT change behavior unnecessarily.
 
 ==================================================
-PIPE READER / CONCURRENCY
+VERIFY WORKER STARTUP
 ==================================================
 
-Be careful with the current SessionPipeServer structure.
+After the signaling fix, trace the full sequence:
 
-The current flow is:
+Browser:
+remote_request
+    ↓
+Host creates session
+    ↓
+session pipe created
+    ↓
+session-agent spawned
+    ↓
+agent hello
+    ↓
+Windows identity verified
+    ↓
+InitSession
+    ↓
+worker initializes
+    ↓
+browser sends offer
+    ↓
+host ACKs offer forwarding immediately
+    ↓
+worker receives offer
+    ↓
+worker creates answer
+    ↓
+host emits async answer
+    ↓
+browser receives answer
+    ↓
+ICE negotiation
+    ↓
+WebRTC connected
+    ↓
+DataChannels opened
+    ↓
+browser signs challenge
+    ↓
+worker verifies signature
+    ↓
+auth_success
+    ↓
+capture begins
+    ↓
+video appears
 
-Accept()
-    -> assigns s.reader
-    -> starts readLoop()
-
-After this fix:
-
-Accept()
-    -> create reader
-    -> read hello with reader
-    -> verify Windows identity
-    -> assign EXACT SAME reader to s.reader
-    -> start readLoop()
-
-Do not have two goroutines reading the same pipe.
-
-Do not have both Accept() and readLoop() concurrently consuming messages.
+Do not skip steps.
 
 ==================================================
-SESSION ID VALIDATION
+DO NOT HIDE THE NEXT FAILURE
 ==================================================
 
-The session worker already receives:
+The current timeout is masking later stages.
 
-sessionID
+After fixing the timeout, make logging detailed enough to determine exactly where the session gets stuck.
 
-when spawned.
+Use sanitized logs such as:
 
-The hello must therefore contain the same session ID.
+[RemoteMgr] Session X received offer
+[RemoteMgr] Session X forwarded offer to agent
+[RemoteMgr] Session X signaling ACK sent
+[Agent] Session X received offer
+[Agent] Session X generated answer
+[WebRTC] Session X connection state: connecting
+[WebRTC] Session X connection state: connected
+[WebRTC] Session X in-band authentication PASSED
+[Agent] Session X starting capture
 
-Reject:
+Do NOT log:
+- private keys
+- auth secrets
+- full SDP if it contains unnecessary sensitive/local network details
+- session secrets
 
-- empty session ID
-- wrong session ID
-- oversized session ID
-- malformed JSON
-- unsupported message type
-- stale/future timestamps outside the existing protocol tolerance
+Session ID is acceptable.
 
-Do not use the client hello to overwrite the server's expected session ID.
+==================================================
+SECURITY
+==================================================
+
+Do NOT weaken any current security mechanism to fix this.
+
+Preserve:
+- cryptographic phone authorization
+- NIP-44
+- signed commands
+- replay protection
+- session ID validation
+- session authentication
+- Windows named-pipe identity verification
+- authorized SID restrictions
+- one-session limit
+- heartbeat timeout
+
+Do not use:
+- unauthenticated WebSockets
+- localhost TCP without authentication
+- plain passwords
+- client-supplied "trusted" flags
 
 ==================================================
 TESTS
 ==================================================
 
-Add regression tests.
+Add regression tests for:
 
-At minimum:
+1. remote_signal successful forwarding returns immediate ACK
 
-1. Test hello envelope encoding/decoding.
+2. ACK preserves original request ID
 
-2. Test that the server requires MsgAgentHello before considering the connection established.
+3. ACK status is "ok"
 
-3. Test wrong message type is rejected.
+4. worker-generated answer remains asynchronous
 
-4. Test wrong session ID is rejected.
+5. canonical "ice-candidate" accepted
 
-5. Test malformed hello is rejected.
+6. "candidate" rejected
 
-6. Test oversized hello is rejected.
+7. canonical "session-close" accepted
 
-7. Test stale hello is rejected if timestamp validation is implemented.
+8. "close" rejected
 
-8. Test that the SAME buffered reader is reused after the hello.
+9. wrong session ID rejected
 
-9. Add a Windows-specific integration test where practical:
-   - create session pipe
-   - connect worker
-   - send hello
-   - server reads hello
-   - identity verification occurs
-   - bootstrap can then be delivered.
+10. wrong phone public key rejected
 
-Do not rely only on a unit test that mocks away the named-pipe behavior.
+11. session-close actually terminates active session
 
-==================================================
-IMPORTANT: PRESERVE EXISTING PROTOCOL
-==================================================
+12. browser no longer waits for 6.5-second timeout after successful signaling forwarding
 
-After the hello handshake succeeds, existing messages must continue unchanged:
+If possible, add a protocol-level integration test covering:
 
-MsgInitSession
-MsgSignalPhoneToAgent
-MsgSignalAgentToPhone
-MsgAuthSuccess
-MsgHeartbeat
-MsgTerminate
-MsgStatusUpdate
-
-Do not rename or break them.
+remote_request
+-> remote_signal offer
+-> ACK
+-> async answer
 
 ==================================================
-CHECK THE FULL STARTUP SEQUENCE
+REAL WINDOWS TEST
 ==================================================
 
-After fixing the named-pipe ordering, trace the COMPLETE sequence:
+After implementing:
 
-Browser
- -> remote_request
- -> SessionManager.HandleSessionRequest()
- -> CreateSession()
- -> NewSessionPipeServer()
- -> SpawnSessionAgent()
- -> worker connects
- -> worker sends MsgAgentHello
- -> server reads hello
- -> server impersonates/verifies worker SID
- -> server accepts
- -> server sends MsgInitSession
- -> worker initializes capture/encoder/WebRTC
- -> signaling proceeds
- -> in-band authentication
- -> screen capture starts
+1. Build the application.
+2. Restart the Windows service.
+3. Open the web dashboard.
+4. Click Remote Desktop.
+5. Click Allow Access.
+6. Verify no "Request timed out".
+7. Verify the PC session-agent starts.
+8. Verify WebRTC answer arrives.
+9. Verify Remote Desktop remains open.
+10. Verify actual screen video appears.
+11. Verify authentication succeeds.
+12. Verify mouse input works.
+13. Exit Remote Desktop.
+14. Verify the session-agent process disappears.
+15. Verify service remains running normally.
 
-Make sure there is no second startup deadlock.
-
-==================================================
-DO NOT STOP AT "BUILD PASSES"
-==================================================
-
-Run:
-
-go test ./...
-
-and Windows-specific tests where available.
-
-Then build the Windows executable.
-
-Actually launch the service and test:
-
-1. Open dashboard.
-2. Click Remote Desktop.
-3. Click Allow Access.
-4. Verify the old ImpersonateNamedPipeClient error is gone.
-5. Verify the worker successfully connects.
-6. Verify the service sends InitSession.
-7. Verify the Remote Desktop session proceeds to WebRTC signaling.
-
-If the next failure is WebRTC/capture/encoder related, report that separately.
-
-Do not claim the Remote Desktop feature is fixed merely because the named-pipe error disappeared.
+Also test:
+- same Wi-Fi
+- phone on mobile data if available
 
 ==================================================
-CODE QUALITY
+PERFORMANCE
 ==================================================
 
-Keep the fix narrow.
+Do not fix the problem by:
+- increasing request timeout
+- creating polling loops
+- repeatedly reconnecting WebRTC
+- spawning additional workers
+- duplicating PeerConnections
 
-Do not rewrite unrelated IPC code.
+Remote signaling messages are tiny and should remain low overhead.
 
-Do not modify the existing hardened root IPC security unless genuinely necessary.
+Keep exactly one Remote Desktop session.
 
-Do not remove PIPE_REJECT_REMOTE_CLIENTS.
+==================================================
+FINAL REPORT
+==================================================
 
-Do not weaken the existing SDDL.
+Report:
 
-Do not add unnecessary dependencies.
+- files changed
+- exact root cause
+- why the original request timed out
+- how the ACK/async signaling separation works
+- protocol names corrected
+- session-close behavior
+- tests passed
+- actual Windows result
+- whether real screen video appeared
+- whether WebRTC connected
+- whether in-band auth succeeded
+- whether mouse input worked
+- any remaining issue
 
-Do not create another pipe implementation.
-
-Reuse the existing root IPC PipeConn and security model.
-
-Finally report:
-
-- exact files changed
-- why the bug occurred
-- how the handshake fixes Windows impersonation ordering
-- tests performed
-- result of actual Remote Desktop startup
-- any next error if the session now progresses further
+Do not call the feature complete until the real screen is visible and the session survives beyond the original request timeout.

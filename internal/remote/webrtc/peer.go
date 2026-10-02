@@ -130,7 +130,7 @@ func NewSessionPeer(sessionID, authChallenge, phonePubKey string, stunServers []
 
 	// Monitor Connection State
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		log.Printf("[WebRTC] PeerConnection state changed: %s", s)
+		log.Printf("[WebRTC] Session %s connection state: %s", sp.sessionID, s)
 		if s == webrtc.PeerConnectionStateConnected {
 			sp.detectTransportType()
 		} else if s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed {
@@ -328,7 +328,7 @@ func (sp *SessionPeer) verifyInBandAuth(msg *input.InputMessage) {
 	authCb := sp.onAuthSuccess
 	sp.mu.Unlock()
 
-	log.Printf("[WebRTC] In-band cryptographic authentication PASSED for session %s (Phone: %s)", sp.sessionID, phonePubKey)
+	log.Printf("[WebRTC] Session %s in-band authentication PASSED", sp.sessionID)
 	sp.sendControlReply(input.InputMessage{Type: "auth_success"})
 
 	if authCb != nil {

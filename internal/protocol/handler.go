@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"regexp"
 	"sync"
 	"time"
@@ -304,6 +305,7 @@ func (h *Handler) ProcessCommandEvent(evt *nostr.Event) (*nostr.Event, error) {
 			return h.BuildEncryptedResponse(evt.PubKey, cmd.ID, "error", "", err.Error(), nil)
 		}
 		if replySig != nil {
+			log.Printf("[RemoteMgr] Session %s signaling ACK sent for %s", cmd.Signal.SessionID, replySig.Type)
 			return h.BuildEncryptedResponsePacket(evt.PubKey, ResponsePacket{
 				ID:        cmd.ID,
 				Status:    "ok",
@@ -311,7 +313,13 @@ func (h *Handler) ProcessCommandEvent(evt *nostr.Event) (*nostr.Event, error) {
 				Timestamp: time.Now().Unix(),
 			})
 		}
-		return nil, nil // Asynchronous signaling will be emitted by worker
+		log.Printf("[RemoteMgr] Session %s signaling ACK sent for %s", cmd.Signal.SessionID, cmd.Signal.Type)
+		return h.BuildEncryptedResponsePacket(evt.PubKey, ResponsePacket{
+			ID:        cmd.ID,
+			Status:    "ok",
+			Message:   "signaling forwarded",
+			Timestamp: time.Now().Unix(),
+		})
 
 	default:
 		return h.BuildEncryptedResponse(evt.PubKey, cmd.ID, "error", "", "Unknown action requested", nil)

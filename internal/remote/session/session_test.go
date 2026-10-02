@@ -170,4 +170,27 @@ func TestSignalingPacketValidation(t *testing.T) {
 	if err := emptyCandidate.Validate(); err == nil {
 		t.Fatalf("expected error on empty candidate")
 	}
+
+	aliasCandidate := SignalingPacket{
+		Type:      "candidate",
+		SessionID: "sess_1",
+		Candidate: &ICECandidate{Candidate: "candidate:1 1 UDP 2130706431 192.168.1.10 8765 typ host"},
+	}
+	if err := aliasCandidate.Validate(); err != nil {
+		t.Fatalf("expected alias candidate to pass, got: %v", err)
+	}
+	if aliasCandidate.Type != SignalCandidate {
+		t.Fatalf("expected candidate to be canonicalized to %s, got: %s", SignalCandidate, aliasCandidate.Type)
+	}
+
+	aliasClose := SignalingPacket{
+		Type:      "close",
+		SessionID: "sess_1",
+	}
+	if err := aliasClose.Validate(); err != nil {
+		t.Fatalf("expected alias close to pass, got: %v", err)
+	}
+	if aliasClose.Type != SignalSessionClose {
+		t.Fatalf("expected close to be canonicalized to %s, got: %s", SignalSessionClose, aliasClose.Type)
+	}
 }

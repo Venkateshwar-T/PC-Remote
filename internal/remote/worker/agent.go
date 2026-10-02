@@ -202,12 +202,14 @@ func (a *SessionAgent) handleDaemonMessage(env *remoteipc.AgentEnvelope, initCha
 		}
 
 		if pkt.Type == session.SignalOffer && a.peer != nil {
+			log.Printf("[Agent] Session %s received offer", a.cfg.SessionID)
 			// Process offer and generate answer
 			answerSDP, err := a.peer.HandleOffer(pkt.SDP)
 			if err != nil {
 				log.Printf("[Agent] Error handling offer: %v", err)
 				return
 			}
+			log.Printf("[Agent] Session %s generated answer", a.cfg.SessionID)
 
 			ansPkt := session.SignalingPacket{
 				Type:      session.SignalAnswer,
@@ -217,22 +219,23 @@ func (a *SessionAgent) handleDaemonMessage(env *remoteipc.AgentEnvelope, initCha
 			}
 			_ = a.pipeClient.Send(remoteipc.MsgSignalAgentToPhone, a.cfg.SessionID, ansPkt)
 
-		} else if pkt.Type == session.SignalCandidate && a.peer != nil && pkt.Candidate != nil {
+		} else if (pkt.Type == session.SignalCandidate || pkt.Type == "candidate") && a.peer != nil && pkt.Candidate != nil {
+			log.Printf("[Agent] Session %s received ice-candidate", a.cfg.SessionID)
 			_ = a.peer.AddCandidate(*pkt.Candidate)
 
-		} else if pkt.Type == session.SignalSessionClose {
-			log.Println("[Agent] Received session-close instruction from daemon")
+		} else if pkt.Type == session.SignalSessionClose || pkt.Type == "close" {
+			log.Printf("[Agent] Session %s received session-close instruction from daemon", a.cfg.SessionID)
 			a.Stop()
 		}
 
 	case remoteipc.MsgTerminate:
-		log.Println("[Agent] Received terminate instruction from daemon")
+		log.Printf("[Agent] Session %s received terminate instruction from daemon", a.cfg.SessionID)
 		a.Stop()
 	}
 }
 
 func (a *SessionAgent) captureAndEncodeLoop(fps int) {
-	log.Printf("[Agent] In-band auth confirmed: Starting screen capture and H.264 encode loop at %d FPS", fps)
+	log.Printf("[Agent] Session %s starting capture and H.264 encode loop at %d FPS", a.cfg.SessionID, fps)
 
 	frameDuration := time.Second / time.Duration(fps)
 	ticker := time.NewTicker(frameDuration)

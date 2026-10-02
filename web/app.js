@@ -1487,13 +1487,13 @@
             sdp: signal.sdp
           }));
         }
-      } else if (signal.type === 'candidate' && signal.candidate) {
+      } else if ((signal.type === 'ice-candidate' || signal.type === 'candidate') && signal.candidate) {
         await remoteRTC.addIceCandidate(new RTCIceCandidate({
           candidate: signal.candidate,
           sdpMid: signal.sdpMid,
           sdpMLineIndex: signal.sdpMLineIndex
         }));
-      } else if (signal.type === 'close') {
+      } else if (signal.type === 'session-close' || signal.type === 'close') {
         showToast('Remote desktop ended by host');
         stopRemoteDesktopSession();
       }
@@ -1598,7 +1598,7 @@
         if (event.candidate && remoteSessionId) {
           sendRemoteSignal({
             session_id: remoteSessionId,
-            type: 'candidate',
+            type: 'ice-candidate',
             candidate: event.candidate.candidate,
             sdpMid: event.candidate.sdpMid,
             sdpMLineIndex: event.candidate.sdpMLineIndex
@@ -1647,7 +1647,7 @@
     if (remoteSessionId) {
       sendRemoteSignal({
         session_id: remoteSessionId,
-        type: 'close'
+        type: 'session-close'
       }).catch(() => {});
     }
 
@@ -2104,6 +2104,7 @@
   window.__remoteDesktop = {
     start: startRemoteDesktopSession,
     stop: stopRemoteDesktopSession,
+    handleIncomingRemoteSignal: handleIncomingRemoteSignal,
     getNormalizedVideoCoordinates: getNormalizedVideoCoordinates,
     GESTURE_CONFIG: GESTURE_CONFIG,
     sendControlMessage: sendControlMessage,

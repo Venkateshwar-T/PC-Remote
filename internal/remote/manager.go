@@ -51,11 +51,11 @@ func (m *SessionManager) SetOutboundSignalHandler(fn func(phonePubKey string, pa
 // HandleSessionRequest handles an incoming "remote_request" action from a paired phone.
 func (m *SessionManager) HandleSessionRequest(phonePubKey string) (*session.SessionResponse, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if m.closed {
+		m.mu.Unlock()
 		return nil, errors.New("remote session manager is shutting down")
 	}
+	m.mu.Unlock()
 
 	// 1. Verify that phone is in AuthorizedDevices
 	if !m.cfg.IsDeviceAuthorized(phonePubKey) {
@@ -90,14 +90,21 @@ func (m *SessionManager) HandleSessionRequest(phonePubKey string) (*session.Sess
 		_ = m.sm.Transition(sessionID, session.StateFailed)
 		return nil, fmt.Errorf("failed to initialize session named pipe: %w", err)
 	}
+
+	m.mu.Lock()
 	m.activePipe = pipeServer
+	m.mu.Unlock()
 
 	// 4. Spawn session-agent into active interactive console session
 	_ = m.sm.Transition(sessionID, session.StateLaunching)
 	procHandle, err := m.spawner.SpawnSessionAgent(sessionID, pipeName, authChallenge, phonePubKey)
 	if err != nil {
-		_ = pipeServer.Close()
-		m.activePipe = nil
+		m.mu.Lock()
+		if m.activePipe == pipeServer {
+			_ = pipeServer.Close()
+			m.activePipe = nil
+		}
+		m.mu.Unlock()
 		_ = m.sm.Transition(sessionID, session.StateFailed)
 		log.Printf("[RemoteMgr] Failed to spawn session-agent: %v", err)
 		return &session.SessionResponse{
@@ -106,7 +113,10 @@ func (m *SessionManager) HandleSessionRequest(phonePubKey string) (*session.Sess
 			Timestamp: time.Now().Unix(),
 		}, nil
 	}
+
+	m.mu.Lock()
 	m.activeProcess = procHandle
+	m.mu.Unlock()
 
 	// 5. Wire pipe callbacks and accept worker connection asynchronously
 	pipeServer.SetOnMessage(func(env *remoteipc.AgentEnvelope) {
@@ -125,8 +135,12 @@ func (m *SessionManager) HandleSessionRequest(phonePubKey string) (*session.Sess
 	select {
 	case err := <-connectedChan:
 		if err != nil {
-			_ = pipeServer.Close()
-			m.activePipe = nil
+			m.mu.Lock()
+			if m.activePipe == pipeServer {
+				_ = pipeServer.Close()
+				m.activePipe = nil
+			}
+			m.mu.Unlock()
 			_ = m.sm.Transition(sessionID, session.StateFailed)
 			log.Printf("[RemoteMgr] Session pipe accept failed for session %s: %v", sessionID, err)
 			return &session.SessionResponse{
@@ -136,8 +150,12 @@ func (m *SessionManager) HandleSessionRequest(phonePubKey string) (*session.Sess
 			}, nil
 		}
 	case <-time.After(5 * time.Second):
-		_ = pipeServer.Close()
-		m.activePipe = nil
+		m.mu.Lock()
+		if m.activePipe == pipeServer {
+			_ = pipeServer.Close()
+			m.activePipe = nil
+		}
+		m.mu.Unlock()
 		_ = m.sm.Transition(sessionID, session.StateFailed)
 		log.Printf("[RemoteMgr] Session agent launch timed out for session %s", sessionID)
 		return &session.SessionResponse{
@@ -159,8 +177,12 @@ func (m *SessionManager) HandleSessionRequest(phonePubKey string) (*session.Sess
 	}
 	if err := pipeServer.Send(remoteipc.MsgInitSession, sessionID, initPayload); err != nil {
 		log.Printf("[RemoteMgr] Failed to send InitSession to agent: %v", err)
-		_ = pipeServer.Close()
-		m.activePipe = nil
+		m.mu.Lock()
+		if m.activePipe == pipeServer {
+			_ = pipeServer.Close()
+			m.activePipe = nil
+		}
+		m.mu.Unlock()
 		_ = m.sm.Transition(sessionID, session.StateFailed)
 		return &session.SessionResponse{
 			Status:    "error",
@@ -197,6 +219,8 @@ func (m *SessionManager) HandleSignaling(phonePubKey string, packet session.Sign
 	// Update heartbeat
 	_ = m.sm.RecordHeartbeat(packet.SessionID)
 
+	log.Printf("[RemoteMgr] Session %s received %s", packet.SessionID, packet.Type)
+
 	switch packet.Type {
 	case session.SignalSessionClose:
 		log.Printf("[RemoteMgr] Received session-close from phone for session %s", packet.SessionID)
@@ -224,6 +248,7 @@ func (m *SessionManager) HandleSignaling(phonePubKey string, packet session.Sign
 			return nil, errors.New("session-agent not connected")
 		}
 
+		log.Printf("[RemoteMgr] Session %s forwarded %s to agent", packet.SessionID, packet.Type)
 		err := pipe.Send(remoteipc.MsgSignalPhoneToAgent, packet.SessionID, packet)
 		if err != nil {
 			return nil, fmt.Errorf("failed to forward signaling to agent: %w", err)

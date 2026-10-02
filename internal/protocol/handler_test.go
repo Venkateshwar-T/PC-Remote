@@ -10,6 +10,7 @@ import (
 	"github.com/nbd-wtf/go-nostr/nip44"
 	"laptopcontrol/internal/config"
 	"laptopcontrol/internal/pairing"
+	"laptopcontrol/internal/remote/session"
 )
 
 func setupTestEnvironment(t *testing.T) (*config.Config, *pairing.Manager, *ReplayGuard, *Handler) {
@@ -253,5 +254,67 @@ func TestProtocol_ChangePinRemotelyForbidden(t *testing.T) {
 	resp := decryptResponse(t, respEvt, clientPrivKey, cfg.LaptopPubKey)
 	if resp.Status != "error" || resp.Error == "" {
 		t.Fatalf("change_pin must be rejected remotely, got: %+v", resp)
+	}
+}
+
+type mockRemoteManager struct {
+	handleSignalingFunc func(phonePubKey string, packet session.SignalingPacket) (*session.SignalingPacket, error)
+}
+
+func (m *mockRemoteManager) HandleSessionRequest(phonePubKey string) (*session.SessionResponse, error) {
+	return &session.SessionResponse{Status: "ready", SessionID: "sess-123"}, nil
+}
+
+func (m *mockRemoteManager) HandleSignaling(phonePubKey string, packet session.SignalingPacket) (*session.SignalingPacket, error) {
+	if m.handleSignalingFunc != nil {
+		return m.handleSignalingFunc(phonePubKey, packet)
+	}
+	return nil, nil
+}
+
+func TestProtocol_RemoteSignalImmediateAck(t *testing.T) {
+	cfg, _, _, handler := setupTestEnvironment(t)
+
+	clientPrivKey := nostr.GeneratePrivateKey()
+	clientPubKey, _ := nostr.GetPublicKey(clientPrivKey)
+	_ = cfg.AuthorizeDevice(clientPubKey, "Authorized Phone")
+
+	mockRM := &mockRemoteManager{
+		handleSignalingFunc: func(phonePubKey string, packet session.SignalingPacket) (*session.SignalingPacket, error) {
+			// Simulates asynchronous forwarding: worker receives offer/candidate, returns nil
+			return nil, nil
+		},
+	}
+	handler.SetRemoteManager(mockRM)
+
+	cmd := CommandPacket{
+		ID:        "req-sig-001",
+		Action:    "remote_signal",
+		Signal: &session.SignalingPacket{
+			Type:      session.SignalOffer,
+			SessionID: "sess-123",
+			SDP:       "v=0\r\no=- 0 0 IN IP4 127.0.0.1...",
+		},
+		Timestamp: time.Now().Unix(),
+	}
+	evt := createClientEvent(t, clientPrivKey, cfg.LaptopPubKey, cmd)
+
+	respEvt, err := handler.ProcessCommandEvent(evt)
+	if err != nil {
+		t.Fatalf("ProcessCommandEvent failed: %v", err)
+	}
+	if respEvt == nil {
+		t.Fatal("Expected immediate correlated ACK event, got nil (would cause client timeout)")
+	}
+
+	resp := decryptResponse(t, respEvt, clientPrivKey, cfg.LaptopPubKey)
+	if resp.ID != cmd.ID {
+		t.Fatalf("expected response ID %s, got %s", cmd.ID, resp.ID)
+	}
+	if resp.Status != "ok" {
+		t.Fatalf("expected status ok, got %s", resp.Status)
+	}
+	if resp.Message != "signaling forwarded" {
+		t.Fatalf("expected message 'signaling forwarded', got %s", resp.Message)
 	}
 }

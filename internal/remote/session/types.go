@@ -104,6 +104,15 @@ func (p *SignalingPacket) Validate() error {
 	if p.SessionID == "" || len(p.SessionID) > 128 {
 		return fmt.Errorf("invalid or missing sessionId")
 	}
+
+	// Canonicalize signal type aliases
+	switch p.Type {
+	case "candidate":
+		p.Type = SignalCandidate
+	case "close":
+		p.Type = SignalSessionClose
+	}
+
 	switch p.Type {
 	case SignalOffer, SignalAnswer:
 		if p.SDP == "" {
